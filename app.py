@@ -261,6 +261,70 @@ def target_cash_from_scores(c_scores: pd.Series, e_scores: pd.Series):
     cash = quantize_cash(raw_cash)
     return cash, second_c, e_med, "euphoria"
 
+
+def standalone_cash_rule(c_score, e_score):
+    """
+    Standalone cash rule for ONE market sleeve.
+
+    Think of KOSPI and S&P500 as two independent 100-unit portfolios.
+    Each portfolio decides its own cash ratio from its own C/E scores only.
+
+    Distress (buying opportunity) has priority:
+      C < 70: use euphoria/neutral rule
+      C 70 -> cash 30
+      C 80 -> cash 20
+      C 90 -> cash 10
+      C 95+ -> cash 0
+
+    Between anchors, interpolate and round to 2.5%p.
+
+    When C < 70, euphoria rebuilds cash:
+      E < 85 -> cash 30
+      E 85 -> 30
+      E 90 -> 40
+      E 94 -> 50
+      E 97+ -> 60
+
+    Final range: 0~60%, step 2.5%p.
+    """
+    if pd.notna(c_score) and c_score >= 70:
+        if c_score >= 95:
+            raw_cash = 0.0
+        elif c_score >= 90:
+            raw_cash = 10 - 2 * (c_score - 90)  # 90->10, 95->0
+        else:
+            raw_cash = 100 - c_score             # 70->30, 80->20, 90->10
+
+        cash = quantize_cash(raw_cash)
+        return cash, f"C-score {c_score:.1f} → 하락구간에서 현금 투입"
+
+    if pd.isna(e_score) or e_score < 85:
+        raw_cash = 30.0
+        reason = "중립"
+    elif e_score < 90:
+        raw_cash = 30 + 2 * (e_score - 85)       # 85->30, 90->40
+        reason = f"E-score {e_score:.1f} → 수익실현 시작"
+    elif e_score < 94:
+        raw_cash = 40 + 2.5 * (e_score - 90)     # 90->40, 94->50
+        reason = f"E-score {e_score:.1f} → 과열"
+    elif e_score < 97:
+        raw_cash = 50 + (10/3) * (e_score - 94)  # 94->50, 97->60
+        reason = f"E-score {e_score:.1f} → 강한 과열"
+    else:
+        raw_cash = 60.0
+        reason = f"E-score {e_score:.1f} → 극단적 과열"
+
+    cash = quantize_cash(raw_cash)
+    return cash, reason
+
+
+def standalone_cash_for_asset(metrics_df, asset):
+    if asset not in metrics_df.index:
+        return np.nan, "데이터 없음"
+    row = metrics_df.loc[asset]
+    return standalone_cash_rule(row["C-score"], row["E-score"])
+
+
 def macro_cash_rule(macro_df: pd.DataFrame):
     c_scores = macro_df["C-score"]
 
@@ -468,6 +532,112 @@ def run_cash_backtest_daily(series_dict, trading_cost_bps=10):
     return bt, stats_df
 
 
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_standalone_cash_backtest(close: pd.Series, asset: str, trading_cost_bps=10):
+    """
+    Daily walk-forward backtest for one market only.
+
+    - Uses only that market's own C/E score.
+    - Signal at day t close -> applied to t+1 return.
+    - 5-year rolling percentile, ~2-year minimum warmup.
+    - Cash target 0~60%, 2.5%p increments.
+    - Trading cost charged when target cash changes.
+    """
+    dd, sep, ret12 = indicator_series(close, asset)
+
+    df = pd.DataFrame({
+        "price": close,
+        "dd": dd,
+        "sep": sep,
+        "ret12": ret12,
+    }).dropna(subset=["price"]).sort_index()
+
+    # Use business-day calendar for stocks.
+    cal = pd.date_range(df.index.min(), df.index.max(), freq="B")
+    df = df.reindex(cal).ffill()
+    df["ret1"] = df["price"].pct_change()
+
+    win = 1260
+    minp = 504
+
+    rank_dd = df["dd"].rolling(win, min_periods=minp).rank(pct=True)
+    rank_sep = df["sep"].rolling(win, min_periods=minp).rank(pct=True)
+    rank_ret = df["ret12"].rolling(win, min_periods=minp).rank(pct=True)
+
+    df["c"] = 0.60 * ((1 - rank_dd) * 100) + 0.40 * ((1 - rank_sep) * 100)
+    df["e"] = 0.60 * (rank_ret * 100) + 0.40 * (rank_sep * 100)
+
+    rows = []
+    prev_cash = None
+
+    for i in range(len(df) - 1):
+        dt = df.index[i]
+        nxt = df.index[i + 1]
+
+        c = df.loc[dt, "c"]
+        e = df.loc[dt, "e"]
+        next_ret = df.loc[nxt, "ret1"]
+
+        if pd.isna(c) or pd.isna(e) or pd.isna(next_ret):
+            continue
+
+        cash, _ = standalone_cash_rule(c, e)
+
+        turnover = 0 if prev_cash is None else abs(cash - prev_cash) / 100
+        cost = turnover * (trading_cost_bps / 10000)
+
+        invested = 1 - cash / 100
+        strategy_ret = invested * next_ret - cost
+
+        rows.append({
+            "date": dt,
+            "cash": cash,
+            "c": c,
+            "e": e,
+            "market_ret_next": next_ret,
+            "strategy_ret": strategy_ret,
+            "fixed0_ret": next_ret,
+            "fixed30_ret": 0.70 * next_ret,
+            "fixed50_ret": 0.50 * next_ret,
+            "turnover": turnover,
+            "cost": cost,
+        })
+
+        prev_cash = cash
+
+    bt = pd.DataFrame(rows).set_index("date")
+    if bt.empty:
+        return bt, pd.DataFrame()
+
+    def stats(ret):
+        ret = ret.dropna()
+        if len(ret) < 252:
+            return {"CAGR": np.nan, "MDD": np.nan, "Sharpe": np.nan, "Calmar": np.nan}
+
+        wealth = (1 + ret).cumprod()
+        years = len(ret) / 252
+        cagr = wealth.iloc[-1] ** (1 / years) - 1
+
+        dd_curve = wealth / wealth.cummax() - 1
+        mdd = dd_curve.min()
+
+        vol = ret.std() * np.sqrt(252)
+        sharpe = (ret.mean() * 252) / vol if vol > 0 else np.nan
+        calmar = cagr / abs(mdd) if mdd < 0 else np.nan
+
+        return {"CAGR": cagr, "MDD": mdd, "Sharpe": sharpe, "Calmar": calmar}
+
+    stats_df = pd.DataFrame({
+        f"{asset} C/E 현금룰": stats(bt["strategy_ret"]),
+        "현금 0% 고정": stats(bt["fixed0_ret"]),
+        "현금 30% 고정": stats(bt["fixed30_ret"]),
+        "현금 50% 고정": stats(bt["fixed50_ret"]),
+    }).T
+
+    return bt, stats_df
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -514,7 +684,7 @@ with st.sidebar:
 
     st.caption("GOLD는 Yahoo Finance의 금 선물(GC=F)을 가격 프록시로 사용합니다.")
 
-    st.caption("현금비중 추천은 0~60% 범위에서 **2.5%p 단위**로 움직입니다.")
+    st.caption("KOSPI와 S&P500의 현금비중 추천은 서로 독립적이며 0~60% 범위에서 **2.5%p 단위**로 움직입니다.")
 
 
 if st.button("🔄 최신 데이터 다시 받기"):
@@ -548,19 +718,40 @@ macro_df = metrics.loc[macro_names].copy()
 m7_df = metrics.loc[m7_names].copy()
 
 
-# SUMMARY
-cash, cash_reason = macro_cash_rule(macro_df)
+# SUMMARY — TWO INDEPENDENT CASH SLEEVES
+kospi_cash, kospi_reason = standalone_cash_for_asset(metrics, "KOSPI")
+sp_cash, sp_reason = standalone_cash_for_asset(metrics, "S&P500")
 
-a, b, c, d = st.columns(4)
-a.metric("추천 현금 비중", f"{cash:g}%")
-b.metric("Macro 최고 C-score", f"{macro_df['C-score'].max():.1f}")
-b.caption(macro_df["C-score"].idxmax())
-c.metric("M7 최고 C-score", f"{m7_df['C-score'].max():.1f}" if not m7_df.empty else "—")
-c.caption(m7_df["C-score"].idxmax() if not m7_df.empty else "")
-d.metric("추적 자산", f"{len(metrics)}개")
+st.subheader("오늘의 독립 현금비중 추천")
 
-st.info(f"**현금 판단:** {cash_reason}  \n\n**M7 개별기회:** {m7_opportunity(m7_df)}")
-st.caption("※ 위 추천 현금비중은 최신 종가 기준 **일별 신호**입니다. 시장이 움직이면 다음 거래일에도 바뀔 수 있습니다.")
+left, right = st.columns(2)
+
+with left:
+    st.markdown("### 🇰🇷 KOSPI 계좌")
+    st.metric("추천 현금", f"{kospi_cash:g}%" if pd.notna(kospi_cash) else "—")
+    if "KOSPI" in metrics.index:
+        r = metrics.loc["KOSPI"]
+        st.caption(
+            f"C-score {r['C-score']:.1f} · E-score {r['E-score']:.1f} · "
+            f"MDD {r['52주 MDD']:.1f}% · 50일 이격 {r['50일 이격']:.1f}%"
+        )
+    st.info(kospi_reason)
+
+with right:
+    st.markdown("### 🇺🇸 S&P500 계좌")
+    st.metric("추천 현금", f"{sp_cash:g}%" if pd.notna(sp_cash) else "—")
+    if "S&P500" in metrics.index:
+        r = metrics.loc["S&P500"]
+        st.caption(
+            f"C-score {r['C-score']:.1f} · E-score {r['E-score']:.1f} · "
+            f"MDD {r['52주 MDD']:.1f}% · 50일 이격 {r['50일 이격']:.1f}%"
+        )
+    st.info(sp_reason)
+
+st.caption(
+    "※ 두 숫자는 서로 완전히 독립적입니다. KOSPI용 자금 100, S&P500용 자금 100이 각각 있다고 가정합니다. "
+    "BTC·GOLD·KOSDAQ·M7의 움직임은 이 두 현금비중 계산에 영향을 주지 않습니다."
+)
 
 
 # MACRO 5
@@ -633,19 +824,28 @@ st.dataframe(entry_df, use_container_width=True)
 
 
 # BACKTEST
-st.subheader("5) C 방식 현금 0~60% 룰 — 일별 Walk-forward 백테스트")
+st.subheader("5) KOSPI / S&P500 독립 현금룰 — 일별 Walk-forward 백테스트")
 st.caption(
-    "매 거래일 종가까지의 정보만 이용해 C/E-score와 목표 현금비중을 계산하고, "
-    "그 신호를 다음 거래일 수익률에 적용합니다. 현금비중은 0~60% 사이에서 **2.5%p 단위로** 매일 바뀔 수 있습니다. "
-    "현금 타이밍 자체를 보기 위해 투자부분은 Macro 5 동일가중 바스켓으로 고정하고, 현금비중 변경에는 거래비용도 반영합니다."
+    "두 시장을 완전히 분리해서 검증합니다. 각 시장은 자기 자신의 MDD·50일 이격·12개월 수익률만 사용합니다. "
+    "다른 자산이 싸거나 비싸도 해당 시장의 현금비중에는 영향을 주지 않습니다. "
+    "신호는 매일 종가 기준, 다음 거래일에 적용하며 거래비용 10bp를 반영합니다."
 )
 
-if len([x for x in MACRO if x in series]) >= 4:
-    with st.spinner("현금 룰 백테스트 계산 중..."):
-        bt, stats_df = run_cash_backtest_daily(series, trading_cost_bps=10)
+for asset in ["KOSPI", "S&P500"]:
+    if asset not in series:
+        continue
 
-    if not stats_df.empty:
-        shown = stats_df.copy()
+    st.markdown(f"### {'🇰🇷' if asset == 'KOSPI' else '🇺🇸'} {asset}")
+
+    with st.spinner(f"{asset} 독립 현금룰 백테스트 계산 중..."):
+        bt_one, stats_one = run_standalone_cash_backtest(
+            series[asset],
+            asset,
+            trading_cost_bps=10
+        )
+
+    if not stats_one.empty:
+        shown = stats_one.copy()
         shown["CAGR"] *= 100
         shown["MDD"] *= 100
 
@@ -659,29 +859,37 @@ if len([x for x in MACRO if x in series]) >= 4:
             use_container_width=True
         )
 
-        if not bt.empty:
-            latest_bt = bt.dropna().tail(252)
-            st.caption("최근 약 1년(252거래일) 일별 추천 현금비중 변화")
-            st.line_chart(latest_bt["cash"])
+        if not bt_one.empty:
+            recent = bt_one.dropna().tail(252)
+            st.caption(f"{asset} 최근 약 1년 일별 추천 현금비중")
+            st.line_chart(recent["cash"])
 
-            st.markdown(
-                """
-**현재 적용한 일별 현금 룰 — 2.5%p 단위**
-- 추천 가능한 현금비중: **0 / 2.5 / 5 / 7.5 / … / 60%**
-- Macro 5에서 **두 번째로 높은 C-score**를 기준으로 하락장에서 현금을 점진적으로 투입
-- 기준점: C=70 → 현금 약 30%, C=80 → 20%, C=90 → 10%, C=95 이상 → 0%
-- 기준점 사이에서는 **선형 보간 후 2.5%p 단위로 반올림**
-- 강한 할인 신호가 없을 때는 KOSPI/KOSDAQ/S&P500/GOLD의 E-score 중앙값으로 현금을 30→60%까지 점진적으로 확대
-- **하락 매수 신호가 과열 매도 신호보다 우선**
-
-이렇게 하면 C-score가 하루에 조금 움직였다고 현금 목표가 10%p씩 튀는 문제를 줄이면서도,
-시장이 더 싸질수록 2.5%p씩 기계적으로 현금을 투입할 수 있습니다.
-"""
+            # Useful debug table: lets the user inspect historical turning points.
+            st.caption(f"{asset} 최근 20거래일 신호")
+            debug = recent[["cash", "c", "e"]].tail(20).copy()
+            debug.columns = ["추천 현금", "C-score", "E-score"]
+            st.dataframe(
+                debug.style.format({
+                    "추천 현금": "{:.1f}%",
+                    "C-score": "{:.1f}",
+                    "E-score": "{:.1f}",
+                }),
+                use_container_width=True
             )
     else:
-        st.warning("백테스트에 필요한 공통 데이터가 충분하지 않습니다.")
-else:
-    st.warning("Macro 데이터가 부족해 백테스트를 실행하지 못했습니다.")
+        st.warning(f"{asset} 백테스트 데이터가 충분하지 않습니다.")
+
+st.markdown("""
+**독립 현금룰**
+- 각 시장마다 별도의 100짜리 계좌가 있다고 가정
+- 추천 현금: **0 / 2.5 / 5 / … / 60%**
+- 해당 시장 C-score가 70을 넘으면 하락폭이 커질수록 현금을 점진적으로 투입
+- C=70 → 현금 약 30%, C=80 → 20%, C=90 → 10%, C=95+ → 0%
+- C<70일 때는 해당 시장 E-score로 수익실현
+- E=85 → 약 30%, E=90 → 40%, E=94 → 50%, E=97+ → 60%
+- **KOSPI 현금에는 S&P/BTC/Gold 등이 전혀 영향을 주지 않음**
+- **S&P500 현금에는 KOSPI/BTC/Gold 등이 전혀 영향을 주지 않음**
+""")
 
 
 # EXPLANATION
@@ -703,9 +911,8 @@ st.markdown("""
 따라서 C-score 95는 “95% 하락했다”는 뜻이 아니라,  
 **그 자산 자신의 역사와 비교했을 때 매우 드문 스트레스 상태**라는 뜻입니다.
 
-**GOLD**  
-금도 KOSPI·BTC와 동일하게 자기 자신의 변동성 분포로 정규화하므로,
-금 -15%와 BTC -15%를 같은 하락으로 취급하지 않습니다.
+**GOLD / BTC / KOSDAQ / M7**  
+계속 자기 역사 대비 C-score와 MDD 빈도를 보여주지만, **KOSPI와 S&P500의 현금비중 추천에는 섞지 않습니다.** 이들은 어느 자산군이 상대적으로 매력적인지 판단하기 위한 참고판입니다.
 """)
 
 st.warning(
