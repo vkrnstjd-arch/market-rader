@@ -257,92 +257,99 @@ def m7_opportunity(m7_df: pd.DataFrame):
 
 
 # =========================================================
-# MONTHLY WALK-FORWARD BACKTEST
+# DAILY WALK-FORWARD BACKTEST
 # =========================================================
-def monthly_signal_table(close: pd.Series, asset: str):
+def build_daily_signal_frame(close: pd.Series, asset: str):
+    """
+    Daily signal frame. C/E scores are computed using only information
+    available up to that date. The final percentile window is ~5 business years.
+    """
     dd, sep, ret12 = indicator_series(close, asset)
 
-    daily = pd.DataFrame({
+    f = pd.DataFrame({
         "price": close,
         "dd": dd,
         "sep": sep,
         "ret12": ret12,
-    }).dropna(subset=["price"])
+    }).sort_index()
 
-    # Month-end observations
-    m = daily.resample("ME").last().dropna(subset=["price"])
-
-    # 5-year rolling distribution at monthly frequency.
-    # No future information is used.
-    window = 60
-    minp = 24
-
-    rank_dd = m["dd"].rolling(window, min_periods=minp).rank(pct=True)
-    rank_sep = m["sep"].rolling(window, min_periods=minp).rank(pct=True)
-    rank_ret = m["ret12"].rolling(window, min_periods=minp).rank(pct=True)
-
-    m["p_dd"] = (1 - rank_dd) * 100
-    m["p_sep"] = (1 - rank_sep) * 100
-    m["c"] = 0.60 * m["p_dd"] + 0.40 * m["p_sep"]
-
-    m["p_ret_up"] = rank_ret * 100
-    m["p_sep_up"] = rank_sep * 100
-    m["e"] = 0.60 * m["p_ret_up"] + 0.40 * m["p_sep_up"]
-
-    m["fwd_ret"] = m["price"].pct_change().shift(-1)
-    return m
+    return f
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def run_cash_backtest(series_dict):
+def run_cash_backtest_daily(series_dict, trading_cost_bps=10):
     """
-    Tests CASH TIMING, not security selection.
+    DAILY walk-forward cash timing backtest.
 
-    The invested portion is an equal-weight Macro 5 basket.
-    This isolates whether varying cash via C/E scores improved the
-    return/drawdown tradeoff versus fixed cash weights.
+    - Signals are calculated at close on day t using only data known by t.
+    - The resulting cash target is applied to t -> t+1 return.
+    - Macro 5 prices are aligned to a common business-day calendar and
+      forward-filled over local holidays.
+    - The invested portion is an equal-weight Macro 5 basket so the test
+      isolates CASH TIMING rather than asset-selection skill.
+    - Trading cost is charged only when target cash weight changes.
+      Default: 10 bps on the absolute portfolio weight changed.
 
-    Signal at month-end t is applied to return t -> t+1 (no look-ahead).
+    This is deliberately a cash-rule test, not a full portfolio optimizer.
     """
-    sig = {}
+    frames = {}
     for asset in MACRO:
         if asset in series_dict:
-            sig[asset] = monthly_signal_table(series_dict[asset], asset)
+            frames[asset] = build_daily_signal_frame(series_dict[asset], asset)
 
-    if len(sig) < 4:
+    if len(frames) < 4:
         return pd.DataFrame(), pd.DataFrame()
 
-    common = None
-    for df in sig.values():
-        idx = df.index
-        common = idx if common is None else common.intersection(idx)
+    # Common business-day calendar.
+    start_date = max(df.index.min() for df in frames.values())
+    end_date = min(df.index.max() for df in frames.values())
+    cal = pd.date_range(start_date, end_date, freq="B")
 
-    common = common.sort_values()
-    if len(common) == 0:
-        return pd.DataFrame(), pd.DataFrame()
+    aligned = {}
+    for asset, df in frames.items():
+        x = df.reindex(cal).ffill()
+
+        # Recompute returns after alignment so BTC/weekend moves flow into
+        # the next business-day return instead of disappearing.
+        x["ret1"] = x["price"].pct_change()
+
+        # Rolling 5-year (~1260 business days) percentile, no future data.
+        win = 1260
+        minp = 504  # require about 2 years before trusting a score
+
+        rank_dd = x["dd"].rolling(win, min_periods=minp).rank(pct=True)
+        rank_sep = x["sep"].rolling(win, min_periods=minp).rank(pct=True)
+        rank_ret = x["ret12"].rolling(win, min_periods=minp).rank(pct=True)
+
+        # Distress: lower raw value = higher percentile score
+        x["c"] = 0.60 * ((1 - rank_dd) * 100) + 0.40 * ((1 - rank_sep) * 100)
+
+        # Euphoria: higher return / higher positive separation = higher score
+        x["e"] = 0.60 * (rank_ret * 100) + 0.40 * (rank_sep * 100)
+
+        aligned[asset] = x
+
+    # Build equal-weight Macro basket daily return.
+    ret_df = pd.DataFrame({a: x["ret1"] for a, x in aligned.items()})
+    basket_ret = ret_df.mean(axis=1, skipna=True)
+
+    c_df = pd.DataFrame({a: x["c"] for a, x in aligned.items()})
+    e_df = pd.DataFrame({a: x["e"] for a, x in aligned.items()})
 
     rows = []
+    prev_cash = None
 
-    for dt in common:
-        cvals = {}
-        evals = {}
-        next_rets = {}
+    for i in range(len(cal) - 1):
+        dt = cal[i]
+        nxt = cal[i + 1]
 
-        for asset, df in sig.items():
-            if dt not in df.index:
-                continue
-            r = df.loc[dt]
-            cvals[asset] = r["c"]
-            evals[asset] = r["e"]
-            next_rets[asset] = r["fwd_ret"]
-
-        cser = pd.Series(cvals).dropna()
-        if len(cser) < 4:
+        cs = c_df.loc[dt].dropna()
+        if len(cs) < 4:
             continue
 
-        second_c = cser.sort_values(ascending=False).iloc[1]
+        second_c = cs.sort_values(ascending=False).iloc[1]
 
-        # C/E balanced rule
+        # Distress has priority over euphoria.
         if second_c >= 95:
             cash = 0
         elif second_c >= 90:
@@ -352,8 +359,9 @@ def run_cash_backtest(series_dict):
         elif second_c >= 70:
             cash = 30
         else:
-            e_subset = [evals.get(x, np.nan) for x in ["KOSPI","KOSDAQ","S&P500","GOLD"]]
-            e_med = pd.Series(e_subset).dropna().median()
+            e_subset = e_df.loc[dt, [x for x in ["KOSPI","KOSDAQ","S&P500","GOLD"] if x in e_df.columns]].dropna()
+            e_med = e_subset.median() if len(e_subset) else np.nan
+
             if pd.notna(e_med) and e_med >= 97:
                 cash = 60
             elif pd.notna(e_med) and e_med >= 94:
@@ -363,22 +371,31 @@ def run_cash_backtest(series_dict):
             else:
                 cash = 30
 
-        rser = pd.Series(next_rets).dropna()
-
-        if len(rser) < 4:
+        next_ret = basket_ret.loc[nxt]
+        if pd.isna(next_ret):
             continue
 
-        basket_ret = rser.mean()
+        invested = 1 - cash / 100
+
+        # Cost only when the target cash allocation changes.
+        turnover = 0 if prev_cash is None else abs(cash - prev_cash) / 100
+        cost = turnover * (trading_cost_bps / 10000)
+
+        strategy_ret = invested * next_ret - cost
 
         rows.append({
             "date": dt,
             "cash": cash,
-            "basket_ret": basket_ret,
-            "strategy_ret": (1 - cash/100) * basket_ret,
-            "fixed0_ret": basket_ret,
-            "fixed30_ret": 0.70 * basket_ret,
-            "fixed50_ret": 0.50 * basket_ret,
+            "basket_ret_next": next_ret,
+            "strategy_ret": strategy_ret,
+            "fixed0_ret": next_ret,
+            "fixed30_ret": 0.70 * next_ret,
+            "fixed50_ret": 0.50 * next_ret,
+            "turnover": turnover,
+            "cost": cost,
         })
+
+        prev_cash = cash
 
     bt = pd.DataFrame(rows).set_index("date")
     if bt.empty:
@@ -386,30 +403,34 @@ def run_cash_backtest(series_dict):
 
     def stats(ret):
         ret = ret.dropna()
-        if len(ret) < 12:
+        if len(ret) < 252:
             return {"CAGR": np.nan, "MDD": np.nan, "Sharpe": np.nan, "Calmar": np.nan}
 
         wealth = (1 + ret).cumprod()
-        years = len(ret) / 12
-        cagr = wealth.iloc[-1] ** (1/years) - 1
+        years = len(ret) / 252
+        cagr = wealth.iloc[-1] ** (1 / years) - 1
 
         dd = wealth / wealth.cummax() - 1
         mdd = dd.min()
 
-        vol = ret.std() * np.sqrt(12)
-        sharpe = (ret.mean() * 12) / vol if vol > 0 else np.nan
+        ann_vol = ret.std() * np.sqrt(252)
+        sharpe = (ret.mean() * 252) / ann_vol if ann_vol > 0 else np.nan
         calmar = cagr / abs(mdd) if mdd < 0 else np.nan
 
-        return {"CAGR": cagr, "MDD": mdd, "Sharpe": sharpe, "Calmar": calmar}
+        return {
+            "CAGR": cagr,
+            "MDD": mdd,
+            "Sharpe": sharpe,
+            "Calmar": calmar,
+        }
 
-    comparisons = {
-        "C-score 현금룰": stats(bt["strategy_ret"]),
+    stats_df = pd.DataFrame({
+        "C-score 일별 현금룰": stats(bt["strategy_ret"]),
         "현금 0% 고정": stats(bt["fixed0_ret"]),
         "현금 30% 고정": stats(bt["fixed30_ret"]),
         "현금 50% 고정": stats(bt["fixed50_ret"]),
-    }
+    }).T
 
-    stats_df = pd.DataFrame(comparisons).T
     return bt, stats_df
 
 
@@ -502,6 +523,7 @@ c.caption(m7_df["C-score"].idxmax() if not m7_df.empty else "")
 d.metric("추적 자산", f"{len(metrics)}개")
 
 st.info(f"**현금 판단:** {cash_reason}  \n\n**M7 개별기회:** {m7_opportunity(m7_df)}")
+st.caption("※ 위 추천 현금비중은 최신 종가 기준 **일별 신호**입니다. 시장이 움직이면 다음 거래일에도 바뀔 수 있습니다.")
 
 
 # MACRO 5
@@ -574,16 +596,16 @@ st.dataframe(entry_df, use_container_width=True)
 
 
 # BACKTEST
-st.subheader("5) C 방식 현금 0~60% 룰 — Walk-forward 백테스트")
+st.subheader("5) C 방식 현금 0~60% 룰 — 일별 Walk-forward 백테스트")
 st.caption(
-    "미래 데이터를 보지 않도록 매월 말 당시까지의 5년 분포로 C/E-score를 만들고, "
-    "그 신호를 다음 달 수익률에 적용합니다. "
-    "현금 타이밍 자체를 보기 위해 투자부분은 Macro 5 동일가중 바스켓으로 고정합니다."
+    "매 거래일 종가까지의 정보만 이용해 C/E-score와 목표 현금비중을 계산하고, "
+    "그 신호를 다음 거래일 수익률에 적용합니다. 현금비중은 0~60% 사이에서 매일 바뀔 수 있습니다. "
+    "현금 타이밍 자체를 보기 위해 투자부분은 Macro 5 동일가중 바스켓으로 고정하고, 현금비중 변경에는 거래비용도 반영합니다."
 )
 
 if len([x for x in MACRO if x in series]) >= 4:
     with st.spinner("현금 룰 백테스트 계산 중..."):
-        bt, stats_df = run_cash_backtest(series)
+        bt, stats_df = run_cash_backtest_daily(series, trading_cost_bps=10)
 
     if not stats_df.empty:
         shown = stats_df.copy()
@@ -601,13 +623,13 @@ if len([x for x in MACRO if x in series]) >= 4:
         )
 
         if not bt.empty:
-            latest_bt = bt.dropna().tail(36)
-            st.caption("최근 36개월 현금비중 변화")
+            latest_bt = bt.dropna().tail(252)
+            st.caption("최근 약 1년(252거래일) 일별 추천 현금비중 변화")
             st.line_chart(latest_bt["cash"])
 
             st.markdown(
                 """
-**현재 적용한 현금 룰**
+**현재 적용한 일별 현금 룰**
 - Macro 5에서 **두 번째로 높은 C-score**가 95 이상 → 현금 **0%**
 - 90 이상 → **10%**
 - 80 이상 → **20%**
