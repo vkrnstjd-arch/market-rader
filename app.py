@@ -191,50 +191,101 @@ def mdd_entry_frequency(close: pd.Series, years=None):
 # =========================================================
 # CASH RULE
 # =========================================================
-def macro_cash_rule(macro_df: pd.DataFrame):
-    """
-    Macro 5 only.
-    Uses two strongest C-scores so a single volatile asset (e.g. BTC) cannot
-    force the whole portfolio to 0% cash by itself.
 
-    Distress has priority:
-      2nd highest C >= 95 -> 0%
-      >= 90 -> 10%
-      >= 80 -> 20%
-      >= 70 -> 30%
+def quantize_cash(value, step=2.5):
+    """Round target cash to 2.5%p increments and clamp to 0~60%."""
+    value = float(np.clip(value, 0, 60))
+    return round(value / step) * step
 
-    When distress is absent, take profits mechanically using broad euphoria.
-    BTC is excluded from euphoria median because its normal volatility is much larger.
-      equity/gold median E >= 97 -> 60%
-      >= 94 -> 50%
-      >= 90 -> 40%
-      otherwise -> 30%
+
+def target_cash_from_scores(c_scores: pd.Series, e_scores: pd.Series):
     """
-    cs = macro_df["C-score"].dropna().sort_values(ascending=False)
+    Shared live/backtest cash engine.
+
+    Distress has priority. The second-highest Macro C-score is used so one
+    unusually volatile asset cannot by itself force the whole portfolio to deploy cash.
+
+    The old 10%p anchors are preserved, but values BETWEEN anchors are interpolated
+    and rounded to 2.5%p increments:
+
+      C2 70 -> cash 30
+      C2 80 -> cash 20
+      C2 90 -> cash 10
+      C2 95 -> cash  0
+
+    When no broad distress signal exists, broad euphoria raises cash gradually:
+      E median <85 -> cash 30
+      85 -> 30
+      90 -> 40
+      94 -> 50
+      97 -> 60
+
+    Final cash is always one of:
+      0, 2.5, 5, 7.5, ... , 60
+    """
+    cs = pd.Series(c_scores).dropna().sort_values(ascending=False)
     second_c = cs.iloc[1] if len(cs) >= 2 else (cs.iloc[0] if len(cs) else np.nan)
 
-    if pd.notna(second_c):
+    # BUY / distress side: deploy cash progressively.
+    if pd.notna(second_c) and second_c >= 70:
         if second_c >= 95:
-            return 0, f"Macro 5 중 최소 2개가 극단적(C≥95)"
-        if second_c >= 90:
-            return 10, f"Macro 5 중 최소 2개가 매우 싸다(C≥90)"
-        if second_c >= 80:
-            return 20, f"Macro 5 중 최소 2개가 싸다(C≥80)"
-        if second_c >= 70:
-            return 30, f"Macro 5 중 최소 2개가 관심구간(C≥70)"
+            raw_cash = 0.0
+        elif second_c >= 90:
+            # 90 -> 10, 95 -> 0
+            raw_cash = 10 - 2 * (second_c - 90)
+        else:
+            # 70 -> 30, 80 -> 20, 90 -> 10
+            raw_cash = 100 - second_c
 
+        cash = quantize_cash(raw_cash)
+        return cash, second_c, np.nan, "distress"
+
+    # SELL / euphoria side: rebuild cash progressively.
+    es = pd.Series(e_scores).dropna()
+    e_med = es.median() if len(es) else np.nan
+
+    if pd.isna(e_med) or e_med < 85:
+        raw_cash = 30.0
+    elif e_med < 90:
+        # 85 -> 30, 90 -> 40
+        raw_cash = 30 + 2 * (e_med - 85)
+    elif e_med < 94:
+        # 90 -> 40, 94 -> 50
+        raw_cash = 40 + 2.5 * (e_med - 90)
+    elif e_med < 97:
+        # 94 -> 50, 97 -> 60
+        raw_cash = 50 + (10/3) * (e_med - 94)
+    else:
+        raw_cash = 60.0
+
+    cash = quantize_cash(raw_cash)
+    return cash, second_c, e_med, "euphoria"
+
+def macro_cash_rule(macro_df: pd.DataFrame):
+    c_scores = macro_df["C-score"]
+
+    # BTC excluded from broad euphoria median because its normal volatility is much larger.
     e_assets = [x for x in ["KOSPI", "KOSDAQ", "S&P500", "GOLD"] if x in macro_df.index]
-    broad_e = macro_df.loc[e_assets, "E-score"].median() if e_assets else np.nan
+    e_scores = macro_df.loc[e_assets, "E-score"] if e_assets else pd.Series(dtype=float)
 
-    if pd.notna(broad_e):
-        if broad_e >= 97:
-            return 60, "광범위한 극단 과열 → 기계적 수익실현"
-        if broad_e >= 94:
-            return 50, "광범위한 강한 과열 → 기계적 수익실현"
-        if broad_e >= 90:
-            return 40, "광범위한 과열 → 일부 수익실현"
+    cash, second_c, e_med, mode = target_cash_from_scores(c_scores, e_scores)
 
-    return 30, "중립"
+    if mode == "distress":
+        if second_c >= 95:
+            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 극단적 할인"
+        elif second_c >= 90:
+            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 매우 싼 구간"
+        elif second_c >= 80:
+            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 싼 구간"
+        else:
+            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 관심 구간"
+
+        return cash, reason + f" → 현금 {cash:g}%"
+
+    if pd.notna(e_med) and e_med >= 85:
+        return cash, f"광범위 E-score 중앙값 {e_med:.1f} → 기계적 수익실현 → 현금 {cash:g}%"
+
+    return cash, f"중립 구간 → 현금 {cash:g}%"
 
 
 def m7_opportunity(m7_df: pd.DataFrame):
@@ -347,29 +398,12 @@ def run_cash_backtest_daily(series_dict, trading_cost_bps=10):
         if len(cs) < 4:
             continue
 
-        second_c = cs.sort_values(ascending=False).iloc[1]
+        e_subset = e_df.loc[
+            dt,
+            [x for x in ["KOSPI","KOSDAQ","S&P500","GOLD"] if x in e_df.columns]
+        ].dropna()
 
-        # Distress has priority over euphoria.
-        if second_c >= 95:
-            cash = 0
-        elif second_c >= 90:
-            cash = 10
-        elif second_c >= 80:
-            cash = 20
-        elif second_c >= 70:
-            cash = 30
-        else:
-            e_subset = e_df.loc[dt, [x for x in ["KOSPI","KOSDAQ","S&P500","GOLD"] if x in e_df.columns]].dropna()
-            e_med = e_subset.median() if len(e_subset) else np.nan
-
-            if pd.notna(e_med) and e_med >= 97:
-                cash = 60
-            elif pd.notna(e_med) and e_med >= 94:
-                cash = 50
-            elif pd.notna(e_med) and e_med >= 90:
-                cash = 40
-            else:
-                cash = 30
+        cash, _, _, _ = target_cash_from_scores(cs, e_subset)
 
         next_ret = basket_ret.loc[nxt]
         if pd.isna(next_ret):
@@ -480,6 +514,9 @@ with st.sidebar:
 
     st.caption("GOLD는 Yahoo Finance의 금 선물(GC=F)을 가격 프록시로 사용합니다.")
 
+    st.caption("현금비중 추천은 0~60% 범위에서 **2.5%p 단위**로 움직입니다.")
+
+
 if st.button("🔄 최신 데이터 다시 받기"):
     st.cache_data.clear()
     st.rerun()
@@ -515,7 +552,7 @@ m7_df = metrics.loc[m7_names].copy()
 cash, cash_reason = macro_cash_rule(macro_df)
 
 a, b, c, d = st.columns(4)
-a.metric("추천 현금 비중", f"{cash}%")
+a.metric("추천 현금 비중", f"{cash:g}%")
 b.metric("Macro 최고 C-score", f"{macro_df['C-score'].max():.1f}")
 b.caption(macro_df["C-score"].idxmax())
 c.metric("M7 최고 C-score", f"{m7_df['C-score'].max():.1f}" if not m7_df.empty else "—")
@@ -599,7 +636,7 @@ st.dataframe(entry_df, use_container_width=True)
 st.subheader("5) C 방식 현금 0~60% 룰 — 일별 Walk-forward 백테스트")
 st.caption(
     "매 거래일 종가까지의 정보만 이용해 C/E-score와 목표 현금비중을 계산하고, "
-    "그 신호를 다음 거래일 수익률에 적용합니다. 현금비중은 0~60% 사이에서 매일 바뀔 수 있습니다. "
+    "그 신호를 다음 거래일 수익률에 적용합니다. 현금비중은 0~60% 사이에서 **2.5%p 단위로** 매일 바뀔 수 있습니다. "
     "현금 타이밍 자체를 보기 위해 투자부분은 Macro 5 동일가중 바스켓으로 고정하고, 현금비중 변경에는 거래비용도 반영합니다."
 )
 
@@ -629,16 +666,16 @@ if len([x for x in MACRO if x in series]) >= 4:
 
             st.markdown(
                 """
-**현재 적용한 일별 현금 룰**
-- Macro 5에서 **두 번째로 높은 C-score**가 95 이상 → 현금 **0%**
-- 90 이상 → **10%**
-- 80 이상 → **20%**
-- 70 이상 → **30%**
-- 강한 할인 신호가 없을 때 시장 전반 E-score가 90/94/97을 넘으면 → 현금 **40/50/60%**
+**현재 적용한 일별 현금 룰 — 2.5%p 단위**
+- 추천 가능한 현금비중: **0 / 2.5 / 5 / 7.5 / … / 60%**
+- Macro 5에서 **두 번째로 높은 C-score**를 기준으로 하락장에서 현금을 점진적으로 투입
+- 기준점: C=70 → 현금 약 30%, C=80 → 20%, C=90 → 10%, C=95 이상 → 0%
+- 기준점 사이에서는 **선형 보간 후 2.5%p 단위로 반올림**
+- 강한 할인 신호가 없을 때는 KOSPI/KOSDAQ/S&P500/GOLD의 E-score 중앙값으로 현금을 30→60%까지 점진적으로 확대
 - **하락 매수 신호가 과열 매도 신호보다 우선**
 
-이렇게 하는 이유는 BTC나 개별 한 자산의 높은 변동성 하나만으로 전체 현금을 모두 쓰는 것을 막고,
-동시에 둘 이상의 자산군이 역사적으로 드문 할인에 들어오면 공격적으로 현금을 쓰기 위해서입니다.
+이렇게 하면 C-score가 하루에 조금 움직였다고 현금 목표가 10%p씩 튀는 문제를 줄이면서도,
+시장이 더 싸질수록 2.5%p씩 기계적으로 현금을 투입할 수 있습니다.
 """
             )
     else:
