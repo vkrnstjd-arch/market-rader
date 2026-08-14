@@ -93,17 +93,36 @@ def euphoria_percentile(series: pd.Series, current: float, years: int) -> float:
     return float((hist <= current).mean() * 100)
 
 
+def c_score_from_mdd(mdd_pct):
+    """Absolute-MDD C-score. No percentile / valuation estimates are used."""
+    if pd.isna(mdd_pct):
+        return np.nan
+
+    # x is positive drawdown magnitude: -20% MDD -> x=20
+    x = max(0.0, -float(mdd_pct))
+    anchors_x = np.array([0, 3, 5, 7.5, 10, 15, 20, 25, 30, 35, 40], dtype=float)
+    anchors_c = np.array([20, 40, 50, 60, 70, 80, 90, 95, 97.5, 99, 100], dtype=float)
+
+    if x >= 40:
+        return 100.0
+    return float(np.interp(x, anchors_x, anchors_c))
+
+
 def rating_label(score):
     if pd.isna(score):
         return "—"
+    if score >= 100:
+        return "🔴 역사적 위기"
+    if score >= 97.5:
+        return "🔴 매우 큰 폭락"
     if score >= 95:
-        return "🔴 극단적"
+        return "🟠 대폭락"
     if score >= 90:
-        return "🟠 매우 싸다"
+        return "🟠 베어마켓"
     if score >= 80:
-        return "🟡 싸다"
+        return "🟡 큰 조정"
     if score >= 70:
-        return "🟢 관심"
+        return "🟢 본격 조정"
     return "⚪ 평범"
 
 
@@ -114,13 +133,12 @@ def calc_metrics(close: pd.Series, asset: str, years: int):
     cur_sep = sep.iloc[-1]
     cur_ret = ret12.iloc[-1]
 
-    p_dd = distress_percentile(dd, cur_dd, years)
-    p_sep = distress_percentile(sep, cur_sep, years)
+    # C-score: ABSOLUTE 52-week MDD only.
+    c = c_score_from_mdd(cur_dd * 100)
 
+    # E-score: unchanged. 12m return percentile 60% + 50d separation percentile 40%.
     p_ret_up = euphoria_percentile(ret12, cur_ret, years)
     p_sep_up = euphoria_percentile(sep, cur_sep, years)
-
-    c = 0.60 * p_dd + 0.40 * p_sep
     e = 0.60 * p_ret_up + 0.40 * p_sep_up
 
     return {
@@ -128,8 +146,6 @@ def calc_metrics(close: pd.Series, asset: str, years: int):
         "52주 MDD": cur_dd * 100,
         "50일 이격": cur_sep * 100,
         "12개월 수익률": cur_ret * 100 if pd.notna(cur_ret) else np.nan,
-        "MDD 극단도": p_dd,
-        "이격 극단도": p_sep,
         "C-score": c,
         "판정": rating_label(c),
         "E-score": e,
@@ -198,158 +214,162 @@ def quantize_cash(value, step=2.5):
     return round(value / step) * step
 
 
-def target_cash_from_scores(c_scores: pd.Series, e_scores: pd.Series):
+def e_cash_target(e_score):
     """
-    Shared live/backtest cash engine.
+    Cash to BUILD while the market is not in a >=10% drawdown.
 
-    Distress has priority. The second-highest Macro C-score is used so one
-    unusually volatile asset cannot by itself force the whole portfolio to deploy cash.
-
-    The old 10%p anchors are preserved, but values BETWEEN anchors are interpolated
-    and rounded to 2.5%p increments:
-
-      C2 70 -> cash 30
-      C2 80 -> cash 20
-      C2 90 -> cash 10
-      C2 95 -> cash  0
-
-    When no broad distress signal exists, broad euphoria raises cash gradually:
-      E median <85 -> cash 30
-      85 -> 30
-      90 -> 40
-      94 -> 50
-      97 -> 60
-
-    Final cash is always one of:
-      0, 2.5, 5, 7.5, ... , 60
-    """
-    cs = pd.Series(c_scores).dropna().sort_values(ascending=False)
-    second_c = cs.iloc[1] if len(cs) >= 2 else (cs.iloc[0] if len(cs) else np.nan)
-
-    # BUY / distress side: deploy cash progressively.
-    if pd.notna(second_c) and second_c >= 70:
-        if second_c >= 95:
-            raw_cash = 0.0
-        elif second_c >= 90:
-            # 90 -> 10, 95 -> 0
-            raw_cash = 10 - 2 * (second_c - 90)
-        else:
-            # 70 -> 30, 80 -> 20, 90 -> 10
-            raw_cash = 100 - second_c
-
-        cash = quantize_cash(raw_cash)
-        return cash, second_c, np.nan, "distress"
-
-    # SELL / euphoria side: rebuild cash progressively.
-    es = pd.Series(e_scores).dropna()
-    e_med = es.median() if len(es) else np.nan
-
-    if pd.isna(e_med) or e_med < 85:
-        raw_cash = 30.0
-    elif e_med < 90:
-        # 85 -> 30, 90 -> 40
-        raw_cash = 30 + 2 * (e_med - 85)
-    elif e_med < 94:
-        # 90 -> 40, 94 -> 50
-        raw_cash = 40 + 2.5 * (e_med - 90)
-    elif e_med < 97:
-        # 94 -> 50, 97 -> 60
-        raw_cash = 50 + (10/3) * (e_med - 94)
-    else:
-        raw_cash = 60.0
-
-    cash = quantize_cash(raw_cash)
-    return cash, second_c, e_med, "euphoria"
-
-
-def standalone_cash_rule(c_score, e_score):
-    """
-    Standalone cash rule for ONE market sleeve.
-
-    Think of KOSPI and S&P500 as two independent 100-unit portfolios.
-    Each portfolio decides its own cash ratio from its own C/E scores only.
-
-    Distress (buying opportunity) has priority:
-      C < 70: use euphoria/neutral rule
-      C 70 -> cash 30
-      C 80 -> cash 20
-      C 90 -> cash 10
-      C 95+ -> cash 0
+    Neutral-market cash floor is 10%. E-score raises it up to 60%:
+      E <= 70 -> 10%
+      E 75 -> 15%
+      E 80 -> 20%
+      E 85 -> 30%
+      E 90 -> 40%
+      E 94 -> 50%
+      E 97+ -> 60%
 
     Between anchors, interpolate and round to 2.5%p.
-
-    When C < 70, euphoria rebuilds cash:
-      E < 85 -> cash 30
-      E 85 -> 30
-      E 90 -> 40
-      E 94 -> 50
-      E 97+ -> 60
-
-    Final range: 0~60%, step 2.5%p.
+    The total system can still reach 0% cash after deep-MDD deployment.
     """
-    if pd.notna(c_score) and c_score >= 70:
-        if c_score >= 95:
-            raw_cash = 0.0
-        elif c_score >= 90:
-            raw_cash = 10 - 2 * (c_score - 90)  # 90->10, 95->0
+    if pd.isna(e_score):
+        return 10.0
+
+    e = float(np.clip(e_score, 0, 100))
+    xp = np.array([0, 70, 75, 80, 85, 90, 94, 97, 100], dtype=float)
+    fp = np.array([10, 10, 15, 20, 30, 40, 50, 60, 60], dtype=float)
+    return quantize_cash(np.interp(e, xp, fp))
+
+
+def drawdown_deployment(mdd_pct):
+    """
+    Conservative 1:2:3:4 deployment of the cash reserve.
+
+    -10%: deploy 10% of reserve (1/10)
+    -20%: deploy another 20% (cumulative 30%)
+    -30%: deploy another 30% (cumulative 60%)
+    -40%: deploy remaining 40% (cumulative 100%)
+    """
+    if pd.isna(mdd_pct):
+        return 0.0, "대기", None
+
+    mdd = float(mdd_pct)
+    if mdd <= -40:
+        return 1.00, "-40%: 잔여 40% 투입", None
+    if mdd <= -30:
+        return 0.60, "-30%: 누적 60% 투입", -40
+    if mdd <= -20:
+        return 0.30, "-20%: 누적 30% 투입", -30
+    if mdd <= -10:
+        return 0.10, "-10%: 누적 10% 투입", -20
+    return 0.0, "E-score로 현금 적립", -10
+
+
+def build_e_score_series(close: pd.Series, asset: str, years=5):
+    """Walk-forward E-score series using only information available on each date."""
+    dd, sep, ret12 = indicator_series(close, asset)
+    df = pd.DataFrame({"price": close, "dd": dd, "sep": sep, "ret12": ret12}).sort_index()
+
+    ppy = periods_per_year(asset)
+    win = max(int(ppy * years), ppy)
+    minp = max(int(ppy * min(years, 2)), int(ppy * 0.75))
+
+    rank_sep = df["sep"].rolling(win, min_periods=minp).rank(pct=True)
+    rank_ret = df["ret12"].rolling(win, min_periods=minp).rank(pct=True)
+    df["e"] = 0.60 * (rank_ret * 100) + 0.40 * (rank_sep * 100)
+    df["mdd_pct"] = df["dd"] * 100
+    df["c"] = df["mdd_pct"].map(c_score_from_mdd)
+    return df
+
+
+def cash_path_from_signals(df: pd.DataFrame):
+    """
+    Stateful engine.
+
+    Above -10% MDD: E-score can only BUILD cash, never reduce it.
+    At the first -10% breach: freeze the cash then on hand as the reserve.
+    Deeper drawdowns deploy that frozen reserve in 1:2:3:4 proportions.
+    After recovery above -10%, keep remaining cash; later E-score can rebuild it higher.
+    """
+    rows = []
+    prev_cash = None
+    reserve_cash = None
+    in_deploy = False
+
+    for dt, r in df.iterrows():
+        e = r.get("e", np.nan)
+        mdd_pct = r.get("mdd_pct", np.nan)
+        c = r.get("c", np.nan)
+
+        if pd.isna(mdd_pct):
+            continue
+
+        used_frac, stage_text, next_level = drawdown_deployment(mdd_pct)
+
+        if mdd_pct > -10:
+            e_target = e_cash_target(e)
+            # E-score is an accumulation signal: never spend cash merely because E cools.
+            if prev_cash is None:
+                cash = e_target
+            else:
+                cash = max(float(prev_cash), float(e_target))
+            reserve_cash = cash
+            in_deploy = False
+            mode = "E 적립" if e_target > (prev_cash if prev_cash is not None else -1) else "현금 유지"
         else:
-            raw_cash = 100 - c_score             # 70->30, 80->20, 90->10
+            if not in_deploy or reserve_cash is None:
+                # Freeze the actual cash available just before the drawdown trigger.
+                reserve_cash = prev_cash if prev_cash is not None else e_cash_target(e)
+                in_deploy = True
+            cash = round(float(reserve_cash * (1 - used_frac)), 1)
+            mode = "MDD 투입"
 
-        cash = quantize_cash(raw_cash)
-        return cash, f"C-score {c_score:.1f} → 하락구간에서 현금 투입"
+        rows.append({
+            "date": dt,
+            "cash": cash,
+            "reserve_cash": reserve_cash,
+            "used_frac": used_frac,
+            "stage": stage_text,
+            "next_level": next_level,
+            "c": c,
+            "e": e,
+            "mdd_pct": mdd_pct,
+            "mode": mode,
+        })
+        prev_cash = cash
 
-    if pd.isna(e_score) or e_score < 85:
-        raw_cash = 30.0
-        reason = "중립"
-    elif e_score < 90:
-        raw_cash = 30 + 2 * (e_score - 85)       # 85->30, 90->40
-        reason = f"E-score {e_score:.1f} → 수익실현 시작"
-    elif e_score < 94:
-        raw_cash = 40 + 2.5 * (e_score - 90)     # 90->40, 94->50
-        reason = f"E-score {e_score:.1f} → 과열"
-    elif e_score < 97:
-        raw_cash = 50 + (10/3) * (e_score - 94)  # 94->50, 97->60
-        reason = f"E-score {e_score:.1f} → 강한 과열"
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("date")
+
+
+def standalone_cash_for_asset(close: pd.Series, asset: str, years: int):
+    sig = build_e_score_series(close, asset, years)
+    path = cash_path_from_signals(sig)
+    if path.empty:
+        return np.nan, "데이터 없음", {}
+
+    r = path.iloc[-1]
+    cash = float(r["cash"])
+    reserve = float(r["reserve_cash"]) if pd.notna(r["reserve_cash"]) else np.nan
+    used_pct = float(r["used_frac"] * 100)
+    mdd = float(r["mdd_pct"])
+    next_level = r["next_level"]
+
+    if r["mode"] == "E 적립":
+        reason = f"E-score {r['e']:.1f} → 현금 적립 구간 → 현금 {cash:g}%"
     else:
-        raw_cash = 60.0
-        reason = f"E-score {e_score:.1f} → 극단적 과열"
+        nxt = f" · 다음 추가매수 {next_level:.0f}%" if pd.notna(next_level) else " · 전액 투입 단계"
+        reason = (
+            f"MDD {mdd:.1f}% → 시작 현금 {reserve:g}% 중 누적 {used_pct:.0f}% 투입"
+            f" → 현금 {cash:g}%{nxt}"
+        )
 
-    cash = quantize_cash(raw_cash)
-    return cash, reason
-
-
-def standalone_cash_for_asset(metrics_df, asset):
-    if asset not in metrics_df.index:
-        return np.nan, "데이터 없음"
-    row = metrics_df.loc[asset]
-    return standalone_cash_rule(row["C-score"], row["E-score"])
-
-
-def macro_cash_rule(macro_df: pd.DataFrame):
-    c_scores = macro_df["C-score"]
-
-    # BTC excluded from broad euphoria median because its normal volatility is much larger.
-    e_assets = [x for x in ["KOSPI", "KOSDAQ", "S&P500", "GOLD"] if x in macro_df.index]
-    e_scores = macro_df.loc[e_assets, "E-score"] if e_assets else pd.Series(dtype=float)
-
-    cash, second_c, e_med, mode = target_cash_from_scores(c_scores, e_scores)
-
-    if mode == "distress":
-        if second_c >= 95:
-            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 극단적 할인"
-        elif second_c >= 90:
-            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 매우 싼 구간"
-        elif second_c >= 80:
-            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 싼 구간"
-        else:
-            reason = f"두 번째로 높은 Macro C-score가 {second_c:.1f} → 관심 구간"
-
-        return cash, reason + f" → 현금 {cash:g}%"
-
-    if pd.notna(e_med) and e_med >= 85:
-        return cash, f"광범위 E-score 중앙값 {e_med:.1f} → 기계적 수익실현 → 현금 {cash:g}%"
-
-    return cash, f"중립 구간 → 현금 {cash:g}%"
+    details = {
+        "reserve_cash": reserve,
+        "used_pct": used_pct,
+        "next_level": next_level,
+        "mode": r["mode"],
+    }
+    return cash, reason, details
 
 
 def m7_opportunity(m7_df: pd.DataFrame):
@@ -361,252 +381,80 @@ def m7_opportunity(m7_df: pd.DataFrame):
     c = row["C-score"]
 
     if c >= 95:
-        return f"🔴 {name}: 극단적 개별 매수기회 (C {c:.1f})"
+        return f"🔴 {name}: 대폭락 구간 (C {c:.1f})"
     if c >= 90:
-        return f"🟠 {name}: 매우 드문 할인 (C {c:.1f})"
+        return f"🟠 {name}: 베어마켓급 낙폭 (C {c:.1f})"
     if c >= 80:
-        return f"🟡 {name}: 싸다 (C {c:.1f})"
+        return f"🟡 {name}: 큰 조정 (C {c:.1f})"
     if c >= 70:
-        return f"🟢 {name}: 관심구간 (C {c:.1f})"
-    return "⚪ 현재 M7에는 강한 개별 할인 신호 없음"
+        return f"🟢 {name}: 본격 조정 (C {c:.1f})"
+    return "⚪ 현재 M7에는 큰 낙폭 신호 없음"
 
 
 # =========================================================
-# DAILY WALK-FORWARD BACKTEST
+# STANDALONE WALK-FORWARD BACKTEST
 # =========================================================
-def build_daily_signal_frame(close: pd.Series, asset: str):
-    """
-    Daily signal frame. C/E scores are computed using only information
-    available up to that date. The final percentile window is ~5 business years.
-    """
-    dd, sep, ret12 = indicator_series(close, asset)
-
-    f = pd.DataFrame({
-        "price": close,
-        "dd": dd,
-        "sep": sep,
-        "ret12": ret12,
-    }).sort_index()
-
-    return f
-
-
 @st.cache_data(ttl=1800, show_spinner=False)
-def run_cash_backtest_daily(series_dict, trading_cost_bps=10):
+def run_standalone_cash_backtest(close: pd.Series, asset: str, percentile_years=5, trading_cost_bps=10):
     """
-    DAILY walk-forward cash timing backtest.
+    Daily walk-forward backtest for one market.
 
-    - Signals are calculated at close on day t using only data known by t.
-    - The resulting cash target is applied to t -> t+1 return.
-    - Macro 5 prices are aligned to a common business-day calendar and
-      forward-filled over local holidays.
-    - The invested portion is an equal-weight Macro 5 basket so the test
-      isolates CASH TIMING rather than asset-selection skill.
-    - Trading cost is charged only when target cash weight changes.
-      Default: 10 bps on the absolute portfolio weight changed.
-
-    This is deliberately a cash-rule test, not a full portfolio optimizer.
+    - C-score = absolute 52-week MDD only.
+    - E-score = 60% 12m-return percentile + 40% 50d-separation percentile.
+    - Above -10% MDD, E-score builds 10~60% cash (neutral floor 10%).
+    - Once -10% is breached, cash available at that point is frozen as the reserve.
+    - Reserve is deployed at -10/-20/-30/-40% in cumulative 10/30/60/100% steps.
+    - Signal at t close is applied to t+1 return.
     """
-    frames = {}
-    for asset in MACRO:
-        if asset in series_dict:
-            frames[asset] = build_daily_signal_frame(series_dict[asset], asset)
+    sig = build_e_score_series(close, asset, percentile_years).copy()
 
-    if len(frames) < 4:
+    # Stocks: business-day calendar. Forward-fill local holidays.
+    cal = pd.date_range(sig.index.min(), sig.index.max(), freq="B")
+    sig = sig.reindex(cal).ffill()
+    sig["ret1"] = sig["price"].pct_change()
+
+    path = cash_path_from_signals(sig)
+    if path.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Common business-day calendar.
-    start_date = max(df.index.min() for df in frames.values())
-    end_date = min(df.index.max() for df in frames.values())
-    cal = pd.date_range(start_date, end_date, freq="B")
-
-    aligned = {}
-    for asset, df in frames.items():
-        x = df.reindex(cal).ffill()
-
-        # Recompute returns after alignment so BTC/weekend moves flow into
-        # the next business-day return instead of disappearing.
-        x["ret1"] = x["price"].pct_change()
-
-        # Rolling 5-year (~1260 business days) percentile, no future data.
-        win = 1260
-        minp = 504  # require about 2 years before trusting a score
-
-        rank_dd = x["dd"].rolling(win, min_periods=minp).rank(pct=True)
-        rank_sep = x["sep"].rolling(win, min_periods=minp).rank(pct=True)
-        rank_ret = x["ret12"].rolling(win, min_periods=minp).rank(pct=True)
-
-        # Distress: lower raw value = higher percentile score
-        x["c"] = 0.60 * ((1 - rank_dd) * 100) + 0.40 * ((1 - rank_sep) * 100)
-
-        # Euphoria: higher return / higher positive separation = higher score
-        x["e"] = 0.60 * (rank_ret * 100) + 0.40 * (rank_sep * 100)
-
-        aligned[asset] = x
-
-    # Build equal-weight Macro basket daily return.
-    ret_df = pd.DataFrame({a: x["ret1"] for a, x in aligned.items()})
-    basket_ret = ret_df.mean(axis=1, skipna=True)
-
-    c_df = pd.DataFrame({a: x["c"] for a, x in aligned.items()})
-    e_df = pd.DataFrame({a: x["e"] for a, x in aligned.items()})
-
     rows = []
     prev_cash = None
+    common = path.index.intersection(sig.index)
 
-    for i in range(len(cal) - 1):
-        dt = cal[i]
-        nxt = cal[i + 1]
-
-        cs = c_df.loc[dt].dropna()
-        if len(cs) < 4:
+    for i in range(len(common) - 1):
+        dt = common[i]
+        nxt = common[i + 1]
+        cash = path.loc[dt, "cash"]
+        next_ret = sig.loc[nxt, "ret1"]
+        if pd.isna(cash) or pd.isna(next_ret):
             continue
-
-        e_subset = e_df.loc[
-            dt,
-            [x for x in ["KOSPI","KOSDAQ","S&P500","GOLD"] if x in e_df.columns]
-        ].dropna()
-
-        cash, _, _, _ = target_cash_from_scores(cs, e_subset)
-
-        next_ret = basket_ret.loc[nxt]
-        if pd.isna(next_ret):
-            continue
-
-        invested = 1 - cash / 100
-
-        # Cost only when the target cash allocation changes.
-        turnover = 0 if prev_cash is None else abs(cash - prev_cash) / 100
-        cost = turnover * (trading_cost_bps / 10000)
-
-        strategy_ret = invested * next_ret - cost
-
-        rows.append({
-            "date": dt,
-            "cash": cash,
-            "basket_ret_next": next_ret,
-            "strategy_ret": strategy_ret,
-            "fixed0_ret": next_ret,
-            "fixed30_ret": 0.70 * next_ret,
-            "fixed50_ret": 0.50 * next_ret,
-            "turnover": turnover,
-            "cost": cost,
-        })
-
-        prev_cash = cash
-
-    bt = pd.DataFrame(rows).set_index("date")
-    if bt.empty:
-        return bt, pd.DataFrame()
-
-    def stats(ret):
-        ret = ret.dropna()
-        if len(ret) < 252:
-            return {"CAGR": np.nan, "MDD": np.nan, "Sharpe": np.nan, "Calmar": np.nan}
-
-        wealth = (1 + ret).cumprod()
-        years = len(ret) / 252
-        cagr = wealth.iloc[-1] ** (1 / years) - 1
-
-        dd = wealth / wealth.cummax() - 1
-        mdd = dd.min()
-
-        ann_vol = ret.std() * np.sqrt(252)
-        sharpe = (ret.mean() * 252) / ann_vol if ann_vol > 0 else np.nan
-        calmar = cagr / abs(mdd) if mdd < 0 else np.nan
-
-        return {
-            "CAGR": cagr,
-            "MDD": mdd,
-            "Sharpe": sharpe,
-            "Calmar": calmar,
-        }
-
-    stats_df = pd.DataFrame({
-        "C-score 일별 현금룰": stats(bt["strategy_ret"]),
-        "현금 0% 고정": stats(bt["fixed0_ret"]),
-        "현금 30% 고정": stats(bt["fixed30_ret"]),
-        "현금 50% 고정": stats(bt["fixed50_ret"]),
-    }).T
-
-    return bt, stats_df
-
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def run_standalone_cash_backtest(close: pd.Series, asset: str, trading_cost_bps=10):
-    """
-    Daily walk-forward backtest for one market only.
-
-    - Uses only that market's own C/E score.
-    - Signal at day t close -> applied to t+1 return.
-    - 5-year rolling percentile, ~2-year minimum warmup.
-    - Cash target 0~60%, 2.5%p increments.
-    - Trading cost charged when target cash changes.
-    """
-    dd, sep, ret12 = indicator_series(close, asset)
-
-    df = pd.DataFrame({
-        "price": close,
-        "dd": dd,
-        "sep": sep,
-        "ret12": ret12,
-    }).dropna(subset=["price"]).sort_index()
-
-    # Use business-day calendar for stocks.
-    cal = pd.date_range(df.index.min(), df.index.max(), freq="B")
-    df = df.reindex(cal).ffill()
-    df["ret1"] = df["price"].pct_change()
-
-    win = 1260
-    minp = 504
-
-    rank_dd = df["dd"].rolling(win, min_periods=minp).rank(pct=True)
-    rank_sep = df["sep"].rolling(win, min_periods=minp).rank(pct=True)
-    rank_ret = df["ret12"].rolling(win, min_periods=minp).rank(pct=True)
-
-    df["c"] = 0.60 * ((1 - rank_dd) * 100) + 0.40 * ((1 - rank_sep) * 100)
-    df["e"] = 0.60 * (rank_ret * 100) + 0.40 * (rank_sep * 100)
-
-    rows = []
-    prev_cash = None
-
-    for i in range(len(df) - 1):
-        dt = df.index[i]
-        nxt = df.index[i + 1]
-
-        c = df.loc[dt, "c"]
-        e = df.loc[dt, "e"]
-        next_ret = df.loc[nxt, "ret1"]
-
-        if pd.isna(c) or pd.isna(e) or pd.isna(next_ret):
-            continue
-
-        cash, _ = standalone_cash_rule(c, e)
 
         turnover = 0 if prev_cash is None else abs(cash - prev_cash) / 100
         cost = turnover * (trading_cost_bps / 10000)
-
         invested = 1 - cash / 100
         strategy_ret = invested * next_ret - cost
 
         rows.append({
             "date": dt,
             "cash": cash,
-            "c": c,
-            "e": e,
+            "reserve_cash": path.loc[dt, "reserve_cash"],
+            "used_frac": path.loc[dt, "used_frac"],
+            "c": path.loc[dt, "c"],
+            "e": path.loc[dt, "e"],
+            "mdd_pct": path.loc[dt, "mdd_pct"],
             "market_ret_next": next_ret,
             "strategy_ret": strategy_ret,
             "fixed0_ret": next_ret,
+            "fixed10_ret": 0.90 * next_ret,
+            "fixed20_ret": 0.80 * next_ret,
             "fixed30_ret": 0.70 * next_ret,
             "fixed50_ret": 0.50 * next_ret,
             "turnover": turnover,
             "cost": cost,
         })
-
         prev_cash = cash
 
-    bt = pd.DataFrame(rows).set_index("date")
+    bt = pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
     if bt.empty:
         return bt, pd.DataFrame()
 
@@ -614,27 +462,24 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, trading_cost_bps=
         ret = ret.dropna()
         if len(ret) < 252:
             return {"CAGR": np.nan, "MDD": np.nan, "Sharpe": np.nan, "Calmar": np.nan}
-
         wealth = (1 + ret).cumprod()
         years = len(ret) / 252
         cagr = wealth.iloc[-1] ** (1 / years) - 1
-
         dd_curve = wealth / wealth.cummax() - 1
         mdd = dd_curve.min()
-
         vol = ret.std() * np.sqrt(252)
         sharpe = (ret.mean() * 252) / vol if vol > 0 else np.nan
         calmar = cagr / abs(mdd) if mdd < 0 else np.nan
-
         return {"CAGR": cagr, "MDD": mdd, "Sharpe": sharpe, "Calmar": calmar}
 
     stats_df = pd.DataFrame({
-        f"{asset} C/E 현금룰": stats(bt["strategy_ret"]),
+        f"{asset} 새 C/E 현금룰": stats(bt["strategy_ret"]),
         "현금 0% 고정": stats(bt["fixed0_ret"]),
+        "현금 10% 고정": stats(bt["fixed10_ret"]),
+        "현금 20% 고정": stats(bt["fixed20_ret"]),
         "현금 30% 고정": stats(bt["fixed30_ret"]),
         "현금 50% 고정": stats(bt["fixed50_ret"]),
     }).T
-
     return bt, stats_df
 
 
@@ -643,15 +488,15 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, trading_cost_bps=
 # =========================================================
 st.title("📉 Market Distress Radar")
 st.caption(
-    "절대 하락률이 아니라 각 자산의 자기 역사에서 얼마나 이례적인 하락인지 비교합니다. "
-    "C-score = MDD 극단도 60% + 50일선 이격 극단도 40%."
+    "C-score는 52주 고점 대비 절대 MDD만 사용하고, E-score는 12개월 수익률 60% + 50일 이격 40%의 역사적 percentile로 계산합니다. "
+    "E-score로 현금을 쌓고, MDD -10/-20/-30/-40%에서 1:2:3:4로 현금을 투입합니다."
 )
 
 with st.sidebar:
     st.header("설정")
 
     percentile_years = st.selectbox(
-        "현재 C-score 비교기간",
+        "E-score percentile 비교기간",
         [3, 5, 10],
         index=1,
         format_func=lambda x: f"최근 {x}년"
@@ -671,20 +516,22 @@ with st.sidebar:
 
     st.divider()
     st.markdown("""
-**C-score 한글 판정**
+**절대 MDD 기반 C-score**
 
-- ⚪ **평범**: 0~69.9
-- 🟢 **관심**: 70~79.9
-- 🟡 **싸다**: 80~89.9
-- 🟠 **매우 싸다**: 90~94.9
-- 🔴 **극단적**: 95~100
+- **-10% → C 70**: 본격 조정
+- **-15% → C 80**: 큰 조정
+- **-20% → C 90**: 베어마켓
+- **-25% → C 95**: 대폭락
+- **-30% → C 97.5**: 매우 큰 폭락
+- **-35% → C 99**: 위기 수준
+- **-40% 이하 → C 100**: 역사적 위기
 
-점수가 높을수록 **그 자산 자신의 역사에 비해** 이례적으로 눌려 있다는 뜻입니다.
+C-score에는 **50일 이격도나 추정 밸류에이션을 넣지 않습니다.**
 """)
 
     st.caption("GOLD는 Yahoo Finance의 금 선물(GC=F)을 가격 프록시로 사용합니다.")
 
-    st.caption("KOSPI와 S&P500의 현금비중 추천은 서로 독립적이며 0~60% 범위에서 **2.5%p 단위**로 움직입니다.")
+    st.caption("KOSPI와 S&P500은 독립 계좌입니다. 평상시 중립 현금은 10%이며, E-score가 높아질수록 10~60% 범위에서 2.5%p 단위로 현금을 늘립니다. 하락장에서는 시작 현금을 -10/-20/-30/-40% MDD에서 정확히 1:2:3:4 비율로 투입하며, 깊은 하락에서는 현금 0%까지 내려갈 수 있습니다.")
 
 
 if st.button("🔄 최신 데이터 다시 받기"):
@@ -719,8 +566,8 @@ m7_df = metrics.loc[m7_names].copy()
 
 
 # SUMMARY — TWO INDEPENDENT CASH SLEEVES
-kospi_cash, kospi_reason = standalone_cash_for_asset(metrics, "KOSPI")
-sp_cash, sp_reason = standalone_cash_for_asset(metrics, "S&P500")
+kospi_cash, kospi_reason, kospi_details = standalone_cash_for_asset(series["KOSPI"], "KOSPI", percentile_years) if "KOSPI" in series else (np.nan, "데이터 없음", {})
+sp_cash, sp_reason, sp_details = standalone_cash_for_asset(series["S&P500"], "S&P500", percentile_years) if "S&P500" in series else (np.nan, "데이터 없음", {})
 
 st.subheader("오늘의 독립 현금비중 추천")
 
@@ -756,7 +603,7 @@ st.caption(
 
 # MACRO 5
 st.subheader("1) Macro 5 — 현재 C-score")
-cols = ["현재가","52주 MDD","50일 이격","12개월 수익률","MDD 극단도","이격 극단도","C-score","판정","기준일"]
+cols = ["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","판정","기준일"]
 macro_show = macro_df[cols].sort_values("C-score", ascending=False)
 
 st.dataframe(
@@ -765,8 +612,6 @@ st.dataframe(
         "52주 MDD": "{:.1f}%",
         "50일 이격": "{:.1f}%",
         "12개월 수익률": "{:.1f}%",
-        "MDD 극단도": "{:.1f}",
-        "이격 극단도": "{:.1f}",
         "C-score": "{:.1f}",
     }, na_rep="—"),
     use_container_width=True
@@ -783,8 +628,6 @@ st.dataframe(
         "52주 MDD": "{:.1f}%",
         "50일 이격": "{:.1f}%",
         "12개월 수익률": "{:.1f}%",
-        "MDD 극단도": "{:.1f}",
-        "이격 극단도": "{:.1f}",
         "C-score": "{:.1f}",
     }, na_rep="—"),
     use_container_width=True
@@ -826,8 +669,8 @@ st.dataframe(entry_df, use_container_width=True)
 # BACKTEST
 st.subheader("5) KOSPI / S&P500 독립 현금룰 — 일별 Walk-forward 백테스트")
 st.caption(
-    "두 시장을 완전히 분리해서 검증합니다. 각 시장은 자기 자신의 MDD·50일 이격·12개월 수익률만 사용합니다. "
-    "다른 자산이 싸거나 비싸도 해당 시장의 현금비중에는 영향을 주지 않습니다. "
+    "두 시장을 완전히 분리해서 검증합니다. C는 절대 MDD, E는 12개월 수익률·50일 이격 percentile만 사용합니다. "
+    "E로 확보한 현금을 -10/-20/-30/-40% MDD에서 1:2:3:4 비율로 투입합니다. "
     "신호는 매일 종가 기준, 다음 거래일에 적용하며 거래비용 10bp를 반영합니다."
 )
 
@@ -841,6 +684,7 @@ for asset in ["KOSPI", "S&P500"]:
         bt_one, stats_one = run_standalone_cash_backtest(
             series[asset],
             asset,
+            percentile_years=percentile_years,
             trading_cost_bps=10
         )
 
@@ -866,11 +710,15 @@ for asset in ["KOSPI", "S&P500"]:
 
             # Useful debug table: lets the user inspect historical turning points.
             st.caption(f"{asset} 최근 20거래일 신호")
-            debug = recent[["cash", "c", "e"]].tail(20).copy()
-            debug.columns = ["추천 현금", "C-score", "E-score"]
+            debug = recent[["cash", "reserve_cash", "used_frac", "mdd_pct", "c", "e"]].tail(20).copy()
+            debug["used_frac"] *= 100
+            debug.columns = ["추천 현금", "시작 현금", "누적 투입률", "MDD", "C-score", "E-score"]
             st.dataframe(
                 debug.style.format({
                     "추천 현금": "{:.1f}%",
+                    "시작 현금": "{:.1f}%",
+                    "누적 투입률": "{:.0f}%",
+                    "MDD": "{:.1f}%",
                     "C-score": "{:.1f}",
                     "E-score": "{:.1f}",
                 }),
@@ -882,13 +730,18 @@ for asset in ["KOSPI", "S&P500"]:
 st.markdown("""
 **독립 현금룰**
 - 각 시장마다 별도의 100짜리 계좌가 있다고 가정
-- 추천 현금: **0 / 2.5 / 5 / … / 60%**
-- 해당 시장 C-score가 70을 넘으면 하락폭이 커질수록 현금을 점진적으로 투입
-- C=70 → 현금 약 30%, C=80 → 20%, C=90 → 10%, C=95+ → 0%
-- C<70일 때는 해당 시장 E-score로 수익실현
-- E=85 → 약 30%, E=90 → 40%, E=94 → 50%, E=97+ → 60%
-- **KOSPI 현금에는 S&P/BTC/Gold 등이 전혀 영향을 주지 않음**
-- **S&P500 현금에는 KOSPI/BTC/Gold 등이 전혀 영향을 주지 않음**
+- **C-score = 절대 52주 MDD만 사용**
+- **E-score = 12개월 수익률 percentile 60% + 50일 이격 percentile 40%**
+- MDD가 -10%보다 얕을 때는 **중립 현금 10%**를 기본으로 두고 E-score로 최대 60%까지 적립
+- E≤70 → 10%, E=75 → 15%, E=80 → 20%, E=85 → 30%, E=90 → 40%, E=94 → 50%, E=97+ → 60%
+- 따라서 박스권·중립장에서는 대체로 현금 10%를 유지하고, 깊은 MDD에서만 0%까지 내려갈 수 있음
+- MDD가 **-10%에 처음 진입하는 순간의 현금**을 이번 하락장의 '시작 현금'으로 고정
+- **-10%: 시작 현금의 10% 투입**
+- **-20%: 추가 20% 투입 (누적 30%)**
+- **-30%: 추가 30% 투입 (누적 60%)**
+- **-40%: 남은 40% 전부 투입 (누적 100%)**
+- 중간 구간에서는 현금을 더 쓰지 않고 다음 MDD 단계까지 대기
+- **KOSPI와 S&P500은 서로 완전히 독립적으로 계산**
 """)
 
 
@@ -896,23 +749,26 @@ st.markdown("""
 st.subheader("6) 해석")
 st.markdown("""
 **52주 MDD**  
-현재 가격이 최근 365일 최고점에서 얼마나 내려와 있는지.
-
-**MDD 극단도**  
-현재 MDD가 해당 자산 자신의 최근 3/5/10년 역사에서 얼마나 드문지.  
-예를 들어 BTC -35%와 S&P500 -35%를 같은 사건으로 취급하지 않습니다.
-
-**50일 이격 극단도**  
-현재 가격이 50일 평균선 아래로 떨어진 정도가 자기 역사에서 얼마나 드문지.
+현재 가격이 최근 365일 최고점에서 얼마나 내려와 있는지입니다.
 
 **C-score**  
-`MDD 극단도 × 60% + 50일 이격 극단도 × 40%`
+절대 MDD만 점수화합니다. 역사적 percentile이나 Forward PBR 같은 추정치는 사용하지 않습니다.  
+핵심 기준은 **-10%=70 / -15%=80 / -20%=90 / -25%=95 / -30%=97.5 / -35%=99 / -40%=100**입니다.
 
-따라서 C-score 95는 “95% 하락했다”는 뜻이 아니라,  
-**그 자산 자신의 역사와 비교했을 때 매우 드문 스트레스 상태**라는 뜻입니다.
+**E-score**  
+`12개월 수익률 percentile × 60% + 50일 이격 percentile × 40%`  
+시장이 얼마나 과열됐는지 보고 평상시 **중립 현금 10%**에서 시작해 최대 60%까지 적립하는 용도입니다. E가 낮다고 해서 평상시 현금을 0%로 만들지는 않으며, 현금 0%는 깊은 MDD에서 준비한 현금을 모두 투입했을 때 도달할 수 있습니다.
+
+**현금 투입 원칙**  
+E-score는 현금을 **쌓는 신호**로만 사용하며, E-score가 낮아졌다는 이유만으로 현금을 다시 주식에 투입하지 않습니다. 실제 현금 투입은 MDD 단계에서만 실행합니다.
+
+E-score로 쌓은 현금을 작은 조정에서 한꺼번에 쓰지 않습니다. -10% MDD 진입 시점의 현금을 기준으로 **1:2:3:4** 비율로 더 깊은 하락에 더 많이 배치합니다.
+
+**수동 판단 여지**  
+추천 현금비중은 기준선일 뿐이며, 실제 운용에서는 시장 상황·개별 포트폴리오 판단에 따라 사용자가 수동으로 조정할 수 있습니다.
 
 **GOLD / BTC / KOSDAQ / M7**  
-계속 자기 역사 대비 C-score와 MDD 빈도를 보여주지만, **KOSPI와 S&P500의 현금비중 추천에는 섞지 않습니다.** 이들은 어느 자산군이 상대적으로 매력적인지 판단하기 위한 참고판입니다.
+C-score와 E-score, MDD 빈도는 참고용으로 계속 보여주지만 **KOSPI와 S&P500의 현금비중에는 영향을 주지 않습니다.**
 """)
 
 st.warning(
