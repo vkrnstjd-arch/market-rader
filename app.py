@@ -25,6 +25,7 @@ M7 = {
 }
 
 ALL = {**MACRO, **M7}
+AUX_ASSETS = ["KOSDAQ", "BTC", "GOLD", *M7.keys()]
 
 
 # =========================================================
@@ -34,7 +35,7 @@ ALL = {**MACRO, **M7}
 def fetch_close(ticker: str) -> pd.Series:
     df = yf.download(
         ticker,
-        start="2010-01-01",
+        start="1980-01-01",
         auto_adjust=True,
         progress=False,
         threads=False,
@@ -93,20 +94,27 @@ def euphoria_percentile(series: pd.Series, current: float, years: int) -> float:
     return float((hist <= current).mean() * 100)
 
 
-def c_score_from_mdd(mdd_pct):
-    """Absolute-MDD C-score. No percentile / valuation estimates are used."""
+def c_score_from_mdd(mdd_pct, asset="KOSPI"):
+    """
+    Absolute-MDD C-score. KOSPI and S&P500 use separate absolute anchors.
+    This is a drawdown-severity score, not a valuation estimate.
+    """
     if pd.isna(mdd_pct):
         return np.nan
-
-    # x is positive drawdown magnitude: -20% MDD -> x=20
     x = max(0.0, -float(mdd_pct))
+
+    if asset == "S&P500":
+        anchors_x = np.array([0, 3, 5, 7.5, 10, 15, 20, 25, 30], dtype=float)
+        anchors_c = np.array([20, 40, 50, 70, 80, 90, 95, 98, 100], dtype=float)
+        if x >= 30:
+            return 100.0
+        return float(np.interp(x, anchors_x, anchors_c))
+
     anchors_x = np.array([0, 3, 5, 7.5, 10, 15, 20, 25, 30, 35, 40], dtype=float)
     anchors_c = np.array([20, 40, 50, 60, 70, 80, 90, 95, 97.5, 99, 100], dtype=float)
-
     if x >= 40:
         return 100.0
     return float(np.interp(x, anchors_x, anchors_c))
-
 
 def rating_label(score):
     if pd.isna(score):
@@ -133,8 +141,9 @@ def calc_metrics(close: pd.Series, asset: str, years: int):
     cur_sep = sep.iloc[-1]
     cur_ret = ret12.iloc[-1]
 
-    # C-score: ABSOLUTE 52-week MDD only.
-    c = c_score_from_mdd(cur_dd * 100)
+    # C-score is used only for KOSPI / S&P500 cash-engine reference.
+    # BTC / GOLD / KOSDAQ / M7 use a separate all-history ATH-drawdown cheapness test.
+    c = c_score_from_mdd(cur_dd * 100, asset) if asset in MARKET_RULES else np.nan
 
     # E-score: unchanged. 12m return percentile 60% + 50d separation percentile 40%.
     p_ret_up = euphoria_percentile(ret12, cur_ret, years)
@@ -150,6 +159,60 @@ def calc_metrics(close: pd.Series, asset: str, years: int):
         "판정": rating_label(c),
         "E-score": e,
         "기준일": str(close.index[-1].date()),
+    }
+
+
+
+
+# =========================================================
+# AUXILIARY ASSET CHEAPNESS: ALL-HISTORY ATH DRAWDOWN
+# =========================================================
+def conservative_aux_label(bottom_gap_pct: float) -> str:
+    """
+    Conservative classification based on how far today's price sits ABOVE the
+    worst historical drawdown bottom, measured in actual price terms.
+
+    Example: worst MDD -50% => worst bottom price = 50 (peak=100).
+             current MDD -45% => current price = 55 => bottom gap = +10%, not 5%p.
+    """
+    if pd.isna(bottom_gap_pct):
+        return "—"
+    g = round(max(0.0, float(bottom_gap_pct)), 8)
+    if g <= 5.0:
+        return "🔥 극단적 매수 구간"
+    if g <= 10.0:
+        return "🔴 매우 싸다"
+    if g <= 20.0:
+        return "🟠 싸다"
+    if g <= 35.0:
+        return "🟡 관심 구간"
+    return "⚪ 보통"
+
+
+def all_history_drawdown_metrics(close: pd.Series):
+    """Compare current ATH drawdown with the worst ATH drawdown in all available data."""
+    s = close.dropna().astype(float).sort_index()
+    if s.empty:
+        return {}
+    running_ath = s.cummax()
+    dd = s / running_ath - 1.0
+    cur_dd = float(dd.iloc[-1])
+    worst_dd = float(dd.min())
+    worst_date = dd.idxmin()
+
+    # Price-relative gap to the historical worst bottom, NOT MDD percentage-point gap.
+    # Both are normalized to their own preceding ATH = 1.
+    denom = 1.0 + worst_dd
+    bottom_gap = ((1.0 + cur_dd) / denom - 1.0) * 100 if denom > 0 else np.nan
+
+    return {
+        "현재가": float(s.iloc[-1]),
+        "ATH 대비 현재 MDD": cur_dd * 100,
+        "역사적 최대 MDD": worst_dd * 100,
+        "역사적 바닥 대비 괴리": bottom_gap,
+        "역사적 최대 MDD 날짜": str(pd.Timestamp(worst_date).date()),
+        "판정": conservative_aux_label(bottom_gap),
+        "기준일": str(pd.Timestamp(s.index[-1]).date()),
     }
 
 
@@ -205,8 +268,68 @@ def mdd_entry_frequency(close: pd.Series, years=None):
 
 
 # =========================================================
-# CASH RULE
+# MARKET-SPECIFIC CASH / REGIME RULES
 # =========================================================
+
+# IMPORTANT
+# - The KOSPI numbers below are the rules discussed/calibrated in this conversation.
+# - S&P500 uses a separate, less-cash-heavy calibration because its volatility/trend
+#   characteristics differ. These are transparent starting parameters, not universal truths.
+MARKET_RULES = {
+    "KOSPI": {
+        "label": "KOSPI",
+        "bull_slope60": 1.0,
+        "bear_slope60": -1.0,
+        "bull_below200_max": 5,
+        "bear_below200_min": 10,
+        "cash_floor": {"BULL": 10.0, "BOX": 15.0, "BEAR": 20.0},
+        "e_x": [0, 70, 75, 80, 85, 90, 94, 97, 100],
+        "e_cash": [10, 10, 15, 20, 30, 40, 50, 60, 60],
+        # Conservative reserve deployment: 1:2:3:4 (cumulative 10/30/60/100%)
+        "dd_levels": [-15.0, -20.0, -30.0, -40.0],
+        "dd_cumulative": [0.10, 0.30, 0.60, 1.00],
+        "rebound_min_pct": 5.0,
+        "recovery_remaining_invest_frac": 0.50,
+        "recovery_above50_10d_min": 7,
+        "reset_days": 40,
+        "stabilize_days": 60,
+        "cash_step_pct": 2.5,
+        "cash_release_days": 21,   # cool-off: release excess cash slowly
+        "cash_rebuild_days": 21,   # after crash/box reset: rebuild ammo slowly
+    },
+    "S&P500": {
+        "label": "S&P500",
+        # Smoother long-term trend: use a slightly smaller MA200 slope threshold.
+        "bull_slope60": 0.75,
+        "bear_slope60": -0.75,
+        "bull_below200_max": 5,
+        "bear_below200_min": 10,
+        # Lower structural cash drag than KOSPI; box/bear still keep dry powder.
+        "cash_floor": {"BULL": 5.0, "BOX": 10.0, "BEAR": 15.0},
+        # E-score is percentile-normalized, but S&P500 requires more extreme E to hold 40~60% cash.
+        "e_x": [0, 75, 80, 85, 90, 94, 97, 99, 100],
+        "e_cash": [5, 5, 10, 20, 30, 40, 50, 60, 60],
+        # Lower-vol market: meaningful drawdowns occur at shallower absolute levels.
+        "dd_levels": [-10.0, -15.0, -20.0, -30.0],
+        "dd_cumulative": [0.10, 0.30, 0.60, 1.00],
+        "rebound_min_pct": 3.5,
+        "recovery_remaining_invest_frac": 0.50,
+        "recovery_above50_10d_min": 7,
+        "reset_days": 30,
+        "stabilize_days": 45,
+        "cash_step_pct": 2.5,
+        # S&P500 cash is released/rebuilt more slowly to avoid frequent tactical churn.
+        "cash_release_days": 42,
+        "cash_rebuild_days": 42,
+    },
+}
+
+GENERIC_RULES = MARKET_RULES["KOSPI"]
+
+
+def rules_for(asset: str):
+    return MARKET_RULES.get(asset, GENERIC_RULES)
+
 
 def quantize_cash(value, step=2.5):
     """Round target cash to 2.5%p increments and clamp to 0~60%."""
@@ -214,59 +337,62 @@ def quantize_cash(value, step=2.5):
     return round(value / step) * step
 
 
-def e_cash_target(e_score):
-    """
-    Cash to BUILD while the market is not in a >=10% drawdown.
-
-    Neutral-market cash floor is 10%. E-score raises it up to 60%:
-      E <= 70 -> 10%
-      E 75 -> 15%
-      E 80 -> 20%
-      E 85 -> 30%
-      E 90 -> 40%
-      E 94 -> 50%
-      E 97+ -> 60%
-
-    Between anchors, interpolate and round to 2.5%p.
-    The total system can still reach 0% cash after deep-MDD deployment.
-    """
+def e_cash_target(e_score, asset):
+    """Market-specific cash target from the overheat E-score."""
+    p = rules_for(asset)
     if pd.isna(e_score):
-        return 10.0
-
+        return float(p["cash_floor"]["BULL"])
     e = float(np.clip(e_score, 0, 100))
-    xp = np.array([0, 70, 75, 80, 85, 90, 94, 97, 100], dtype=float)
-    fp = np.array([10, 10, 15, 20, 30, 40, 50, 60, 60], dtype=float)
-    return quantize_cash(np.interp(e, xp, fp))
+    return quantize_cash(np.interp(e, np.array(p["e_x"], dtype=float), np.array(p["e_cash"], dtype=float)))
 
 
-def drawdown_deployment(mdd_pct):
+def regime_cash_floor(regime, asset):
+    p = rules_for(asset)
+    return float(p["cash_floor"].get(regime, p["cash_floor"]["BOX"]))
+
+
+def classify_regime(ma200_slope60_pct, below200_20d, asset):
     """
-    Conservative 1:2:3:4 deployment of the cash reserve.
-
-    -10%: deploy 10% of reserve (1/10)
-    -20%: deploy another 20% (cumulative 30%)
-    -30%: deploy another 30% (cumulative 60%)
-    -40%: deploy remaining 40% (cumulative 100%)
+    Uses MA200 slope + persistence. A 1~3 day MA200 break alone does not create a bear regime.
     """
-    if pd.isna(mdd_pct):
-        return 0.0, "대기", None
+    p = rules_for(asset)
+    if pd.isna(ma200_slope60_pct) or pd.isna(below200_20d):
+        return "BOX"
+    if ma200_slope60_pct >= p["bull_slope60"] and below200_20d <= p["bull_below200_max"]:
+        return "BULL"
+    if ma200_slope60_pct <= p["bear_slope60"] and below200_20d >= p["bear_below200_min"]:
+        return "BEAR"
+    return "BOX"
 
-    mdd = float(mdd_pct)
-    if mdd <= -40:
-        return 1.00, "-40%: 잔여 40% 투입", None
-    if mdd <= -30:
-        return 0.60, "-30%: 누적 60% 투입", -40
-    if mdd <= -20:
-        return 0.30, "-20%: 누적 30% 투입", -30
-    if mdd <= -10:
-        return 0.10, "-10%: 누적 10% 투입", -20
-    return 0.0, "E-score로 현금 적립", -10
+
+def regime_label(regime):
+    return {
+        "BULL": "🟢 상승 추세",
+        "BOX": "🟡 박스/중립",
+        "BEAR": "🔴 하락 추세",
+    }.get(regime, "—")
+
+
+def drawdown_deployment(cycle_worst_mdd_pct, asset):
+    """Return cumulative fraction of the frozen reserve that should already be invested."""
+    p = rules_for(asset)
+    levels = p["dd_levels"]
+    cumulative = p["dd_cumulative"]
+    if pd.isna(cycle_worst_mdd_pct):
+        return 0.0, "대기", levels[0]
+
+    mdd = float(cycle_worst_mdd_pct)
+    for j in range(len(levels) - 1, -1, -1):
+        if mdd <= levels[j]:
+            next_level = levels[j + 1] if j + 1 < len(levels) else None
+            return cumulative[j], f"{levels[j]:g}%: 누적 {cumulative[j]*100:.0f}% 투입", next_level
+    return 0.0, "대기", levels[0]
 
 
 def build_e_score_series(close: pd.Series, asset: str, years=5):
-    """Walk-forward E-score series using only information available on each date."""
+    """Walk-forward signal frame using only information available on each date."""
     dd, sep, ret12 = indicator_series(close, asset)
-    df = pd.DataFrame({"price": close, "dd": dd, "sep": sep, "ret12": ret12}).sort_index()
+    df = pd.DataFrame({"price": close, "dd52": dd, "sep": sep, "ret12": ret12}).sort_index()
 
     ppy = periods_per_year(asset)
     win = max(int(ppy * years), ppy)
@@ -275,66 +401,223 @@ def build_e_score_series(close: pd.Series, asset: str, years=5):
     rank_sep = df["sep"].rolling(win, min_periods=minp).rank(pct=True)
     rank_ret = df["ret12"].rolling(win, min_periods=minp).rank(pct=True)
     df["e"] = 0.60 * (rank_ret * 100) + 0.40 * (rank_sep * 100)
-    df["mdd_pct"] = df["dd"] * 100
-    df["c"] = df["mdd_pct"].map(c_score_from_mdd)
+    df["mdd52_pct"] = df["dd52"] * 100
+    df["c"] = df["mdd52_pct"].map(lambda x: c_score_from_mdd(x, asset))
+
+    # Trend/regime inputs. A brief MA200 break does NOT define a bear market.
+    df["ma50"] = df["price"].rolling(50, min_periods=30).mean()
+    df["ma200"] = df["price"].rolling(200, min_periods=120).mean()
+    df["ma50_slope20_pct"] = (df["ma50"] / df["ma50"].shift(20) - 1) * 100
+    df["ma200_slope60_pct"] = (df["ma200"] / df["ma200"].shift(60) - 1) * 100
+    df["below200"] = (df["price"] < df["ma200"]).astype(float)
+    df["below200_20d"] = df["below200"].rolling(20, min_periods=10).sum()
+    df["above50"] = (df["price"] > df["ma50"]).astype(float)
+    df["above50_10d"] = df["above50"].rolling(10, min_periods=5).sum()
+    df["regime"] = [
+        classify_regime(s, b, asset)
+        for s, b in zip(df["ma200_slope60_pct"], df["below200_20d"])
+    ]
     return df
 
 
-def cash_path_from_signals(df: pd.DataFrame):
+def cash_path_from_signals(df: pd.DataFrame, asset: str):
     """
-    Stateful engine.
+    Stateful path-dependent engine.
 
-    Above -10% MDD: E-score can only BUILD cash, never reduce it.
-    At the first -10% breach: freeze the cash then on hand as the reserve.
-    Deeper drawdowns deploy that frozen reserve in 1:2:3:4 proportions.
-    After recovery above -10%, keep remaining cash; later E-score can rebuild it higher.
+    NORMAL
+    - Market-specific E-score target + regime cash floor.
+    - Cash can rise immediately when risk/overheat target rises.
+    - When target falls, cash is released only 2.5%p at a time (hysteresis), not dumped in one day.
+    - After a crash-cycle reset, ammo is rebuilt slowly toward the new target/floor.
+
+    DRAWDOWN
+    - KOSPI starts at -15%; S&P500 starts at -10%.
+    - Freeze cash on hand as reserve.
+    - Use the WORST local-cycle MDD reached (ratchet), so a rebound never restores sold cash.
+    - Market-specific 1:2:3:4 deployment thresholds.
+    - Recovery signal can invest half of the remaining cash if price/MA50 trend recovers and regime is not BEAR.
+    - Old peak can reset after recovery OR prolonged BOX stabilization, even without reclaiming the old high.
     """
+    p = rules_for(asset)
+    first_dd = p["dd_levels"][0]
     rows = []
     prev_cash = None
+    cycle_peak = None
+    in_drawdown = False
     reserve_cash = None
-    in_deploy = False
+    cycle_worst_mdd = 0.0
+    trough_price = None
+    trough_i = None
+    max_since_trough = None
+    recovery_applied = False
+    rebuilding = False
+    last_adjust_i = None
 
-    for dt, r in df.iterrows():
+    for i, (dt, r) in enumerate(df.iterrows()):
+        price = r.get("price", np.nan)
         e = r.get("e", np.nan)
-        mdd_pct = r.get("mdd_pct", np.nan)
+        regime = r.get("regime", "BOX")
         c = r.get("c", np.nan)
+        mdd52_pct = r.get("mdd52_pct", np.nan)
+        ma50 = r.get("ma50", np.nan)
+        ma50_slope20 = r.get("ma50_slope20_pct", np.nan)
+        above50_10d = r.get("above50_10d", np.nan)
+        ma200_slope60 = r.get("ma200_slope60_pct", np.nan)
+        below200_20d = r.get("below200_20d", np.nan)
 
-        if pd.isna(mdd_pct):
+        if pd.isna(price):
             continue
 
-        used_frac, stage_text, next_level = drawdown_deployment(mdd_pct)
+        if cycle_peak is None:
+            cycle_peak = float(price)
 
-        if mdd_pct > -10:
-            e_target = e_cash_target(e)
-            # E-score is an accumulation signal: never spend cash merely because E cools.
+        # Local cycle peak is allowed to advance only outside an active drawdown cycle.
+        if not in_drawdown:
+            cycle_peak = max(float(cycle_peak), float(price))
+        cycle_mdd = (float(price) / float(cycle_peak) - 1.0) * 100
+
+        if not in_drawdown:
+            target = max(e_cash_target(e, asset), regime_cash_floor(regime, asset))
+
             if prev_cash is None:
-                cash = e_target
+                cash = target
+                last_adjust_i = i
+            elif target > float(prev_cash) + 1e-9:
+                if rebuilding:
+                    # After a crash, do not jump from 0~5% straight back to a 10~20% floor.
+                    if last_adjust_i is None or (i - last_adjust_i) >= p["cash_rebuild_days"]:
+                        cash = min(float(prev_cash) + p["cash_step_pct"], float(target))
+                        last_adjust_i = i
+                    else:
+                        cash = float(prev_cash)
+                else:
+                    # Overheat/risk accumulation may build to the target as the signal rises.
+                    cash = float(target)
+                    last_adjust_i = i
+            elif target < float(prev_cash) - 1e-9:
+                # E cooling without a true drawdown: release cash slowly, never all at once.
+                if last_adjust_i is None or (i - last_adjust_i) >= p["cash_release_days"]:
+                    cash = max(float(prev_cash) - p["cash_step_pct"], float(target))
+                    last_adjust_i = i
+                else:
+                    cash = float(prev_cash)
             else:
-                cash = max(float(prev_cash), float(e_target))
-            reserve_cash = cash
-            in_deploy = False
-            mode = "E 적립" if e_target > (prev_cash if prev_cash is not None else -1) else "현금 유지"
+                cash = float(prev_cash)
+
+            if rebuilding and cash >= target - 1e-9:
+                rebuilding = False
+
+            mode = "정상/E·레짐"
+            stage_text = f"{regime_label(regime)} · 목표현금 {target:g}%"
+            next_level = first_dd
+            used_frac = 0.0
+
+            # Enter path-dependent drawdown mode.
+            if cycle_mdd <= first_dd:
+                in_drawdown = True
+                reserve_cash = float(cash)
+                cycle_worst_mdd = float(cycle_mdd)
+                trough_price = float(price)
+                trough_i = i
+                max_since_trough = float(price)
+                recovery_applied = False
+                rebuilding = False
+
+                used_frac, stage_text, next_level = drawdown_deployment(cycle_worst_mdd, asset)
+                cash = min(float(cash), float(reserve_cash) * (1 - used_frac))
+                mode = "하락장/MDD 투입"
         else:
-            if not in_deploy or reserve_cash is None:
-                # Freeze the actual cash available just before the drawdown trigger.
-                reserve_cash = prev_cash if prev_cash is not None else e_cash_target(e)
-                in_deploy = True
-            cash = round(float(reserve_cash * (1 - used_frac)), 1)
-            mode = "MDD 투입"
+            # Ratchet: remember the worst local-cycle MDD even after a rebound.
+            if cycle_mdd < cycle_worst_mdd:
+                cycle_worst_mdd = float(cycle_mdd)
+                trough_price = float(price)
+                trough_i = i
+                max_since_trough = float(price)
+            else:
+                max_since_trough = max(float(max_since_trough), float(price)) if max_since_trough is not None else float(price)
+
+            used_frac, stage_text, next_level = drawdown_deployment(cycle_worst_mdd, asset)
+            stage_cash = float(reserve_cash) * (1 - used_frac)
+            cash = min(float(prev_cash) if prev_cash is not None else stage_cash, stage_cash)
+            mode = "하락장/MDD 투입"
+
+            rebound_from_trough_pct = (
+                (float(price) / float(trough_price) - 1.0) * 100
+                if trough_price and trough_price > 0 else 0.0
+            )
+
+            recovery_signal = (
+                not recovery_applied
+                and regime != "BEAR"
+                and pd.notna(ma50) and float(price) > float(ma50)
+                and pd.notna(ma50_slope20) and float(ma50_slope20) > 0
+                and pd.notna(above50_10d) and float(above50_10d) >= p["recovery_above50_10d_min"]
+                and rebound_from_trough_pct >= p["rebound_min_pct"]
+            )
+
+            if recovery_signal:
+                invest_frac = p["recovery_remaining_invest_frac"]
+                cash = quantize_cash(float(cash) * (1 - invest_frac))
+                recovery_applied = True
+                mode = "회복 확인/추가 투입"
+                stage_text += f" · 회복신호 → 남은 현금 {invest_frac*100:.0f}% 추가 투입"
+
+            days_since_trough = (i - trough_i) if trough_i is not None else 0
+            strong_reset = (
+                recovery_applied
+                and days_since_trough >= p["reset_days"]
+                and regime != "BEAR"
+                and pd.notna(ma50) and float(price) > float(ma50)
+                and pd.notna(ma50_slope20) and float(ma50_slope20) > 0
+            )
+
+            # Explicit box/stabilization reset: old high must not dominate forever.
+            box_reset = (
+                days_since_trough >= p["stabilize_days"]
+                and regime == "BOX"
+                and pd.notna(above50_10d) and float(above50_10d) >= 5
+                and rebound_from_trough_pct >= p["rebound_min_pct"]
+            )
+
+            if strong_reset or box_reset:
+                in_drawdown = False
+                cycle_peak = max(float(max_since_trough), float(price))
+                reserve_cash = None
+                cycle_worst_mdd = 0.0
+                trough_price = None
+                trough_i = None
+                max_since_trough = None
+                recovery_applied = False
+                rebuilding = True
+                last_adjust_i = i - p["cash_rebuild_days"]  # allow one small rebuild step now
+                mode = "사이클 리셋/현금 재축적"
+                why = "회복 추세" if strong_reset else "박스 안정화"
+                stage_text = f"{why}로 새 로컬 고점 리셋 · {regime_label(regime)}"
+                next_level = first_dd
+                used_frac = 0.0
 
         rows.append({
             "date": dt,
-            "cash": cash,
+            "cash": float(cash),
             "reserve_cash": reserve_cash,
             "used_frac": used_frac,
             "stage": stage_text,
             "next_level": next_level,
             "c": c,
             "e": e,
-            "mdd_pct": mdd_pct,
+            "mdd_pct": mdd52_pct,
+            "mdd52_pct": mdd52_pct,
+            "cycle_mdd_pct": cycle_mdd,
+            "cycle_worst_mdd_pct": cycle_worst_mdd if in_drawdown else np.nan,
             "mode": mode,
+            "regime": regime,
+            "ma200_slope60_pct": ma200_slope60,
+            "below200_20d": below200_20d,
+            "ma50_slope20_pct": ma50_slope20,
+            "above50_10d": above50_10d,
+            "recovery_applied": recovery_applied,
         })
-        prev_cash = cash
+        prev_cash = float(cash)
 
     if not rows:
         return pd.DataFrame()
@@ -343,34 +626,44 @@ def cash_path_from_signals(df: pd.DataFrame):
 
 def standalone_cash_for_asset(close: pd.Series, asset: str, years: int):
     sig = build_e_score_series(close, asset, years)
-    path = cash_path_from_signals(sig)
+    path = cash_path_from_signals(sig, asset)
     if path.empty:
         return np.nan, "데이터 없음", {}
 
     r = path.iloc[-1]
     cash = float(r["cash"])
     reserve = float(r["reserve_cash"]) if pd.notna(r["reserve_cash"]) else np.nan
-    used_pct = float(r["used_frac"] * 100)
-    mdd = float(r["mdd_pct"])
+    used_pct = float(r["used_frac"] * 100) if pd.notna(r["used_frac"]) else 0.0
     next_level = r["next_level"]
 
-    if r["mode"] == "E 적립":
-        reason = f"E-score {r['e']:.1f} → 현금 적립 구간 → 현금 {cash:g}%"
-    else:
-        nxt = f" · 다음 추가매수 {next_level:.0f}%" if pd.notna(next_level) else " · 전액 투입 단계"
+    if "하락장" in r["mode"] or "회복" in r["mode"]:
+        nxt = f" · 다음 MDD 단계 {next_level:g}%" if pd.notna(next_level) else " · MDD 단계 전액 투입"
         reason = (
-            f"MDD {mdd:.1f}% → 시작 현금 {reserve:g}% 중 누적 {used_pct:.0f}% 투입"
+            f"{regime_label(r['regime'])} · 사이클 최저 MDD {r['cycle_worst_mdd_pct']:.1f}%"
+            f" · 시작현금 {reserve:g}% 중 MDD 누적 {used_pct:.0f}% 단계"
             f" → 현금 {cash:g}%{nxt}"
         )
+        if r["mode"] == "회복 확인/추가 투입":
+            reason += " · 50일선 회복·상승 신호 반영"
+    elif r["mode"] == "사이클 리셋/현금 재축적":
+        reason = f"하락 사이클 리셋 · {regime_label(r['regime'])} → 현금 {cash:g}%부터 천천히 탄약 재축적"
+    else:
+        target = max(e_cash_target(r["e"], asset), regime_cash_floor(r["regime"], asset))
+        reason = f"{regime_label(r['regime'])} · E-score {r['e']:.1f} · 목표현금 {target:g}% → 현재 현금 {cash:g}%"
 
     details = {
         "reserve_cash": reserve,
         "used_pct": used_pct,
         "next_level": next_level,
         "mode": r["mode"],
+        "regime": r["regime"],
+        "cycle_mdd": float(r["cycle_mdd_pct"]),
+        "cycle_worst_mdd": float(r["cycle_worst_mdd_pct"]) if pd.notna(r["cycle_worst_mdd_pct"]) else np.nan,
+        "ma200_slope60": float(r["ma200_slope60_pct"]) if pd.notna(r["ma200_slope60_pct"]) else np.nan,
+        "below200_20d": float(r["below200_20d"]) if pd.notna(r["below200_20d"]) else np.nan,
+        "ma50_slope20": float(r["ma50_slope20_pct"]) if pd.notna(r["ma50_slope20_pct"]) else np.nan,
     }
     return cash, reason, details
-
 
 def m7_opportunity(m7_df: pd.DataFrame):
     if m7_df.empty:
@@ -390,7 +683,6 @@ def m7_opportunity(m7_df: pd.DataFrame):
         return f"🟢 {name}: 본격 조정 (C {c:.1f})"
     return "⚪ 현재 M7에는 큰 낙폭 신호 없음"
 
-
 # =========================================================
 # STANDALONE WALK-FORWARD BACKTEST
 # =========================================================
@@ -401,9 +693,9 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, percentile_years=
 
     - C-score = absolute 52-week MDD only.
     - E-score = 60% 12m-return percentile + 40% 50d-separation percentile.
-    - Above -10% MDD, E-score builds 10~60% cash (neutral floor 10%).
-    - Once -10% is breached, cash available at that point is frozen as the reserve.
-    - Reserve is deployed at -10/-20/-30/-40% in cumulative 10/30/60/100% steps.
+    - KOSPI and S&P500 use separate regime/cash/drawdown parameters.
+    - Once the market-specific drawdown trigger is breached, cash on hand is frozen as reserve.
+    - The reserve is deployed with market-specific 1:2:3:4 thresholds.
     - Signal at t close is applied to t+1 return.
     """
     sig = build_e_score_series(close, asset, percentile_years).copy()
@@ -413,7 +705,7 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, percentile_years=
     sig = sig.reindex(cal).ffill()
     sig["ret1"] = sig["price"].pct_change()
 
-    path = cash_path_from_signals(sig)
+    path = cash_path_from_signals(sig, asset)
     if path.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -488,8 +780,8 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, percentile_years=
 # =========================================================
 st.title("📉 Market Distress Radar")
 st.caption(
-    "C-score는 52주 고점 대비 절대 MDD만 사용하고, E-score는 12개월 수익률 60% + 50일 이격 40%의 역사적 percentile로 계산합니다. "
-    "E-score로 현금을 쌓고, MDD -10/-20/-30/-40%에서 1:2:3:4로 현금을 투입합니다."
+    "KOSPI와 S&P500은 서로 다른 상태·경로형 현금 엔진을 사용합니다. "
+    "BTC·GOLD·KOSDAQ·M7은 현금비중에 영향을 주지 않고, 각 자산의 전체 가용 역사에서 ATH 대비 최대 MDD와 현재 MDD를 비교해 저가 구간만 판정합니다."
 )
 
 with st.sidebar:
@@ -516,7 +808,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("""
-**절대 MDD 기반 C-score**
+**절대 MDD 기반 C-score (아래는 KOSPI 기준)**
 
 - **-10% → C 70**: 본격 조정
 - **-15% → C 80**: 큰 조정
@@ -526,12 +818,28 @@ with st.sidebar:
 - **-35% → C 99**: 위기 수준
 - **-40% 이하 → C 100**: 역사적 위기
 
-C-score에는 **50일 이격도나 추정 밸류에이션을 넣지 않습니다.**
+C-score에는 **50일 이격도나 추정 밸류에이션을 넣지 않습니다.**  
+S&P500은 별도 기준: **-7.5%=70 / -10%=80 / -15%=90 / -20%=95 / -25%=98 / -30%=100**.
+""")
+
+    st.markdown("""
+**BTC · GOLD · KOSDAQ · M7 보수적 저가 판정**
+
+현재 ATH 대비 MDD를 **전체 가용 역사상 최대 MDD의 실제 바닥가격**과 비교합니다.
+MDD %p 차이가 아니라 가격 차이입니다.
+
+- 역사적 최악 바닥 대비 **+5% 이내 → 🔥 극단적 매수**
+- **+10% 이내 → 매우 싸다**
+- **+20% 이내 → 싸다**
+- **+35% 이내 → 관심**
+- 그 이상 → 보통
+
+예: 역사적 최대 MDD -50%, 현재 -45%라면 바닥 50 대비 현재 55이므로 **+10%**입니다.
 """)
 
     st.caption("GOLD는 Yahoo Finance의 금 선물(GC=F)을 가격 프록시로 사용합니다.")
 
-    st.caption("KOSPI와 S&P500은 독립 계좌입니다. 평상시 중립 현금은 10%이며, E-score가 높아질수록 10~60% 범위에서 2.5%p 단위로 현금을 늘립니다. 하락장에서는 시작 현금을 -10/-20/-30/-40% MDD에서 정확히 1:2:3:4 비율로 투입하며, 깊은 하락에서는 현금 0%까지 내려갈 수 있습니다.")
+    st.caption("KOSPI와 S&P500은 독립 계좌이며 세부 파라미터도 다릅니다. KOSPI는 -15%부터, S&P500은 -10%부터 하락 모드가 발동합니다. 현재 MDD가 아니라 사이클 최저 MDD를 기억하고, 박스권·회복 시에는 옛 전고점을 자동으로 리셋할 수 있습니다.")
 
 
 if st.button("🔄 최신 데이터 다시 받기"):
@@ -563,6 +871,15 @@ m7_names = [x for x in M7 if x in metrics.index]
 
 macro_df = metrics.loc[macro_names].copy()
 m7_df = metrics.loc[m7_names].copy()
+
+aux_rows = []
+for name in AUX_ASSETS:
+    if name in series:
+        x = all_history_drawdown_metrics(series[name])
+        if x:
+            x["자산"] = name
+            aux_rows.append(x)
+aux_df = pd.DataFrame(aux_rows).set_index("자산") if aux_rows else pd.DataFrame()
 
 
 # SUMMARY — TWO INDEPENDENT CASH SLEEVES
@@ -601,37 +918,42 @@ st.caption(
 )
 
 
-# MACRO 5
-st.subheader("1) Macro 5 — 현재 C-score")
-cols = ["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","판정","기준일"]
-macro_show = macro_df[cols].sort_values("C-score", ascending=False)
-
+# MARKET CASH-ENGINE SIGNALS
+st.subheader("1) KOSPI / S&P500 — 현금 엔진 참고 신호")
+market_names = [x for x in ["KOSPI", "S&P500"] if x in metrics.index]
+market_cols = ["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","판정","기준일"]
+market_show = metrics.loc[market_names, market_cols].copy()
 st.dataframe(
-    macro_show.style.format({
+    market_show.style.format({
         "현재가": "{:,.2f}",
         "52주 MDD": "{:.1f}%",
         "50일 이격": "{:.1f}%",
         "12개월 수익률": "{:.1f}%",
         "C-score": "{:.1f}",
+        "E-score": "{:.1f}",
     }, na_rep="—"),
     use_container_width=True
 )
 
-
-# M7
-st.subheader("2) Magnificent 7 — 개별 C-score")
-m7_show = m7_df[cols].sort_values("C-score", ascending=False)
-
-st.dataframe(
-    m7_show.style.format({
-        "현재가": "${:,.2f}",
-        "52주 MDD": "{:.1f}%",
-        "50일 이격": "{:.1f}%",
-        "12개월 수익률": "{:.1f}%",
-        "C-score": "{:.1f}",
-    }, na_rep="—"),
-    use_container_width=True
+st.subheader("2) BTC · GOLD · KOSDAQ · M7 — 역사적 MDD 저가 판정")
+st.caption(
+    "현금 추천에는 영향을 주지 않습니다. '역사적 바닥 대비 괴리'는 MDD %p 차이가 아니라, "
+    "각 drawdown의 직전 ATH를 100으로 놓았을 때 역사적 최악 바닥가격 대비 현재 가격이 몇 % 위인지 계산합니다."
 )
+if not aux_df.empty:
+    aux_show = aux_df[["현재가","ATH 대비 현재 MDD","역사적 최대 MDD","역사적 바닥 대비 괴리","판정","역사적 최대 MDD 날짜","기준일"]].copy()
+    aux_show = aux_show.sort_values("역사적 바닥 대비 괴리", ascending=True)
+    st.dataframe(
+        aux_show.style.format({
+            "현재가": "{:,.2f}",
+            "ATH 대비 현재 MDD": "{:.1f}%",
+            "역사적 최대 MDD": "{:.1f}%",
+            "역사적 바닥 대비 괴리": "+{:.1f}%",
+        }, na_rep="—"),
+        use_container_width=True
+    )
+else:
+    st.warning("보조자산 MDD 데이터를 계산하지 못했습니다.")
 
 
 # DAY FREQUENCY
@@ -669,8 +991,8 @@ st.dataframe(entry_df, use_container_width=True)
 # BACKTEST
 st.subheader("5) KOSPI / S&P500 독립 현금룰 — 일별 Walk-forward 백테스트")
 st.caption(
-    "두 시장을 완전히 분리해서 검증합니다. C는 절대 MDD, E는 12개월 수익률·50일 이격 percentile만 사용합니다. "
-    "E로 확보한 현금을 -10/-20/-30/-40% MDD에서 1:2:3:4 비율로 투입합니다. "
+    "두 시장을 완전히 분리해서 검증합니다. KOSPI는 -15/-20/-30/-40%, S&P500은 -10/-15/-20/-30%에서 "
+    "1:2:3:4 누적 비율로 준비 현금을 투입합니다. MA200은 하루 돌파가 아니라 기울기·20일 지속성으로 레짐을 판정합니다. "
     "신호는 매일 종가 기준, 다음 거래일에 적용하며 거래비용 10bp를 반영합니다."
 )
 
@@ -728,47 +1050,59 @@ for asset in ["KOSPI", "S&P500"]:
         st.warning(f"{asset} 백테스트 데이터가 충분하지 않습니다.")
 
 st.markdown("""
-**독립 현금룰**
-- 각 시장마다 별도의 100짜리 계좌가 있다고 가정
-- **C-score = 절대 52주 MDD만 사용**
-- **E-score = 12개월 수익률 percentile 60% + 50일 이격 percentile 40%**
-- MDD가 -10%보다 얕을 때는 **중립 현금 10%**를 기본으로 두고 E-score로 최대 60%까지 적립
-- E≤70 → 10%, E=75 → 15%, E=80 → 20%, E=85 → 30%, E=90 → 40%, E=94 → 50%, E=97+ → 60%
-- 따라서 박스권·중립장에서는 대체로 현금 10%를 유지하고, 깊은 MDD에서만 0%까지 내려갈 수 있음
-- MDD가 **-10%에 처음 진입하는 순간의 현금**을 이번 하락장의 '시작 현금'으로 고정
-- **-10%: 시작 현금의 10% 투입**
-- **-20%: 추가 20% 투입 (누적 30%)**
-- **-30%: 추가 30% 투입 (누적 60%)**
-- **-40%: 남은 40% 전부 투입 (누적 100%)**
-- 중간 구간에서는 현금을 더 쓰지 않고 다음 MDD 단계까지 대기
-- **KOSPI와 S&P500은 서로 완전히 독립적으로 계산**
-""")
+**시장별 독립 현금룰**
 
+**KOSPI**
+- 상승/박스/하락 기본 현금: **10% / 15% / 20%**
+- 하락 모드 시작: **로컬 고점 대비 -15%**
+- 준비 현금 투입: **-15 / -20 / -30 / -40% → 누적 10 / 30 / 60 / 100%**
+- 회복 확인: 50일선 회복 + 50일선 상승 + 저점 대비 5% 이상 반등 + 하락 레짐 아님
+- 박스 안정화가 이어지면 전고점 회복 전에도 새 로컬 고점으로 사이클 리셋
+
+**S&P500**
+- 상승/박스/하락 기본 현금: **5% / 10% / 15%**
+- 하락 모드 시작: **로컬 고점 대비 -10%**
+- 준비 현금 투입: **-10 / -15 / -20 / -30% → 누적 10 / 30 / 60 / 100%**
+- E-score가 매우 높아질 때도 KOSPI보다 더 높은 임계값을 요구해 현금 드래그를 줄임
+- 회복/현금 재축적 속도도 KOSPI보다 느리게 설정
+
+**공통 구조**
+- 현재 MDD가 아니라 **이번 사이클 최저 MDD**를 기억하는 래칫 방식
+- 하락 중 반등했다고 이미 투자한 돈을 다시 현금으로 되돌리지 않음
+- MA200은 단순 상·하회가 아니라 **60일 기울기 + 최근 20일 하회 일수**로 상승/박스/하락 레짐 판정
+- E가 식어도 현금을 하루 만에 확 줄이지 않고 **2.5%p씩 천천히 해제**
+- 폭락 후 박스권에서는 시장별 현금 바닥까지 **2.5%p씩 천천히 재축적**
+- 깊은 MDD에서는 최종적으로 **현금 0%까지 허용**
+""")
 
 # EXPLANATION
 st.subheader("6) 해석")
 st.markdown("""
-**52주 MDD**  
-현재 가격이 최근 365일 최고점에서 얼마나 내려와 있는지입니다.
-
 **C-score**  
-절대 MDD만 점수화합니다. 역사적 percentile이나 Forward PBR 같은 추정치는 사용하지 않습니다.  
-핵심 기준은 **-10%=70 / -15%=80 / -20%=90 / -25%=95 / -30%=97.5 / -35%=99 / -40%=100**입니다.
+절대 MDD 기반의 낙폭 점수이며 **KOSPI와 S&P500 현금 엔진용 참고지표**입니다. 가치평가가 아니라 하락 깊이를 봅니다.  
+KOSPI는 기존 절대 MDD 기준을 유지하고, **S&P500은 더 낮은 변동성을 반영해 같은 MDD를 더 높은 C-score로 평가**합니다.
+
+**BTC · GOLD · KOSDAQ · M7 저가 판정**  
+C-score를 쓰지 않습니다. 전체 가용 가격 역사에서 `현재 ATH MDD`와 `역사적 최대 ATH MDD`를 구한 뒤, **역사적 최악 바닥가격 대비 현재 가격의 실제 괴리율**로 판정합니다.  
+보수적으로 **+5% 이내만 극단적 매수**, +10% 이내 매우 싸다, +20% 이내 싸다, +35% 이내 관심으로 표시합니다. 이 신호들은 KOSPI/S&P500 현금비중에 영향을 주지 않습니다.
 
 **E-score**  
-`12개월 수익률 percentile × 60% + 50일 이격 percentile × 40%`  
-시장이 얼마나 과열됐는지 보고 평상시 **중립 현금 10%**에서 시작해 최대 60%까지 적립하는 용도입니다. E가 낮다고 해서 평상시 현금을 0%로 만들지는 않으며, 현금 0%는 깊은 MDD에서 준비한 현금을 모두 투입했을 때 도달할 수 있습니다.
+`12개월 수익률 percentile × 60% + 50일 이격 percentile × 40%`입니다. 과열 시 탄약을 만드는 보조 신호입니다.  
+KOSPI와 S&P500의 E→현금 매핑도 다르며, S&P500은 더 극단적인 E에서만 큰 현금비중을 권합니다.
 
-**현금 투입 원칙**  
-E-score는 현금을 **쌓는 신호**로만 사용하며, E-score가 낮아졌다는 이유만으로 현금을 다시 주식에 투입하지 않습니다. 실제 현금 투입은 MDD 단계에서만 실행합니다.
+**Regime**  
+200일선을 하루 이틀 깼는지는 중요하게 보지 않습니다. **200일선 60일 기울기와 최근 20일 동안 200일선 아래에 있었던 일수**를 함께 사용해 상승/박스/하락을 구분합니다.
 
-E-score로 쌓은 현금을 작은 조정에서 한꺼번에 쓰지 않습니다. -10% MDD 진입 시점의 현금을 기준으로 **1:2:3:4** 비율로 더 깊은 하락에 더 많이 배치합니다.
+**Path-dependent MDD**  
+현금 추천은 오늘의 52주 MDD만 보고 매일 초기화하지 않습니다. 한 번 하락 모드가 시작되면 **그 사이클에서 실제로 찍었던 최저 MDD**를 기억합니다. 바닥 -30% 후 현재 -23%로 반등해도 -30% 단계에서 이미 집행한 매수는 되돌리지 않습니다.
 
-**수동 판단 여지**  
-추천 현금비중은 기준선일 뿐이며, 실제 운용에서는 시장 상황·개별 포트폴리오 판단에 따라 사용자가 수동으로 조정할 수 있습니다.
+**Recovery / Reset**  
+50일선 회복·상승과 저점 대비 반등이 확인되면 남은 현금 일부를 추가 투자합니다. 또한 전고점을 끝내 회복하지 못해도 박스권 안정화가 충분히 지속되면 옛 전고점을 버리고 새로운 로컬 고점을 기준으로 다음 사이클을 시작합니다.
 
-**GOLD / BTC / KOSDAQ / M7**  
-C-score와 E-score, MDD 빈도는 참고용으로 계속 보여주지만 **KOSPI와 S&P500의 현금비중에는 영향을 주지 않습니다.**
+**현금 재축적**  
+폭락 후 현금이 거의 0%가 된 상태에서 박스권으로 넘어가도 현금을 하루 만에 10~20%로 만들지 않습니다. 시장별 속도로 **2.5%p씩 점진적으로** 탄약을 다시 만듭니다.
+
+추천값은 기계적 기준선입니다. 실제 운용에서는 포트폴리오 상황과 시장 해석에 따라 수동 조정할 수 있습니다.
 """)
 
 st.warning(
