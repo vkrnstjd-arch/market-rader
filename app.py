@@ -126,7 +126,7 @@ def rating_label(score):
     if score >= 95:
         return "🟠 대폭락"
     if score >= 90:
-        return "🟠 베어마켓"
+        return "🟠 깊은 조정"
     if score >= 80:
         return "🟡 큰 조정"
     if score >= 70:
@@ -676,7 +676,7 @@ def m7_opportunity(m7_df: pd.DataFrame):
     if c >= 95:
         return f"🔴 {name}: 대폭락 구간 (C {c:.1f})"
     if c >= 90:
-        return f"🟠 {name}: 베어마켓급 낙폭 (C {c:.1f})"
+        return f"🟠 {name}: 깊은 조정 (C {c:.1f})"
     if c >= 80:
         return f"🟡 {name}: 큰 조정 (C {c:.1f})"
     if c >= 70:
@@ -812,7 +812,7 @@ with st.sidebar:
 
 - **-10% → C 70**: 본격 조정
 - **-15% → C 80**: 큰 조정
-- **-20% → C 90**: 베어마켓
+- **-20% → C 90**: 깊은 조정
 - **-25% → C 95**: 대폭락
 - **-30% → C 97.5**: 매우 큰 폭락
 - **-35% → C 99**: 위기 수준
@@ -899,6 +899,8 @@ with left:
             f"C-score {r['C-score']:.1f} · E-score {r['E-score']:.1f} · "
             f"MDD {r['52주 MDD']:.1f}% · 50일 이격 {r['50일 이격']:.1f}%"
         )
+        if kospi_details:
+            st.caption(f"낙폭 판정 {r['판정']} · 시장 상태 {regime_label(kospi_details.get('regime'))}")
     st.info(kospi_reason)
 
 with right:
@@ -910,6 +912,8 @@ with right:
             f"C-score {r['C-score']:.1f} · E-score {r['E-score']:.1f} · "
             f"MDD {r['52주 MDD']:.1f}% · 50일 이격 {r['50일 이격']:.1f}%"
         )
+        if sp_details:
+            st.caption(f"낙폭 판정 {r['판정']} · 시장 상태 {regime_label(sp_details.get('regime'))}")
     st.info(sp_reason)
 
 st.caption(
@@ -920,9 +924,20 @@ st.caption(
 
 # MARKET CASH-ENGINE SIGNALS
 st.subheader("1) KOSPI / S&P500 — 현금 엔진 참고 신호")
+st.caption("※ 낙폭 판정은 C-score(MDD 깊이)이고, 시장 상태는 MA200 기울기·지속성으로 계산한 별도 Regime입니다. '하락 추세'라는 표현은 시장 상태에만 사용합니다.")
 market_names = [x for x in ["KOSPI", "S&P500"] if x in metrics.index]
 market_cols = ["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","판정","기준일"]
 market_show = metrics.loc[market_names, market_cols].copy()
+
+# C-score describes drawdown severity only. Regime is a separate trend-state signal.
+market_show = market_show.rename(columns={"판정": "낙폭 판정"})
+regime_map = {
+    "KOSPI": regime_label(kospi_details.get("regime")) if kospi_details else "—",
+    "S&P500": regime_label(sp_details.get("regime")) if sp_details else "—",
+}
+market_show.insert(7, "시장 상태", [regime_map.get(x, "—") for x in market_show.index])
+market_show = market_show[["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","낙폭 판정","시장 상태","기준일"]]
+
 st.dataframe(
     market_show.style.format({
         "현재가": "{:,.2f}",
