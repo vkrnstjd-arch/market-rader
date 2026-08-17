@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-st.set_page_config(page_title="Market Distress Radar", page_icon="📉", layout="wide")
+st.set_page_config(page_title="Market Radar · Portfolio OS", page_icon="🧭", layout="wide")
 
 MACRO = {
     "KOSPI": "^KS11",
@@ -775,82 +775,219 @@ def run_standalone_cash_backtest(close: pd.Series, asset: str, percentile_years=
     return bt, stats_df
 
 
+
 # =========================================================
-# UI
+# PORTFOLIO OS EXTENSIONS
 # =========================================================
-st.title("📉 Market Distress Radar")
-st.caption(
-    "KOSPI와 S&P500은 서로 다른 상태·경로형 현금 엔진을 사용합니다. "
-    "BTC·GOLD·KOSDAQ·M7은 현금비중에 영향을 주지 않고, 각 자산의 전체 가용 역사에서 ATH 대비 최대 MDD와 현재 MDD를 비교해 저가 구간만 판정합니다."
-)
+import io
+import re
+from urllib.parse import quote
+import requests
 
-with st.sidebar:
-    st.header("설정")
+DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1B9jNFFQW0dCqZUzJMoHb7sNpT-9k02G16A2PwJPUx9A/edit?usp=drivesdk"
+DEFAULT_SHEET_NAME = "포트폴리오"
 
-    percentile_years = st.selectbox(
-        "E-score percentile 비교기간",
-        [3, 5, 10],
-        index=1,
-        format_func=lambda x: f"최근 {x}년"
-    )
+# 사용자가 지금 논의 중인 전술 포지션. 목표에 도달하면 자동으로 추가매수 제안이 사라집니다.
+TACTICAL_PLAN = {
+    "name": "SOL 반도체전공정",
+    "code": "475300",
+    "ticker": "475300.KS",
+    "target_weight": 3.5,
+    "funding": [
+        ("SOL AI반도체소부장", 1.5),
+        ("에이피알", 0.8),
+        ("삼양식품", 0.7),
+        ("신세계", 0.5),
+    ],
+}
 
-    freq_choice = st.selectbox(
-        "MDD 빈도표 비교기간",
-        ["최근 5년", "최근 10년", "전체 가용기간"],
-        index=2
-    )
-
-    freq_years = {
-        "최근 5년": 5,
-        "최근 10년": 10,
-        "전체 가용기간": None
-    }[freq_choice]
-
-    st.divider()
-    st.markdown("""
-**절대 MDD 기반 C-score (아래는 KOSPI 기준)**
-
-- **-10% → C 70**: 본격 조정
-- **-15% → C 80**: 큰 조정
-- **-20% → C 90**: 깊은 조정
-- **-25% → C 95**: 대폭락
-- **-30% → C 97.5**: 매우 큰 폭락
-- **-35% → C 99**: 위기 수준
-- **-40% 이하 → C 100**: 역사적 위기
-
-C-score에는 **50일 이격도나 추정 밸류에이션을 넣지 않습니다.**  
-S&P500은 별도 기준: **-7.5%=70 / -10%=80 / -15%=90 / -20%=95 / -25%=98 / -30%=100**.
-""")
-
-    st.markdown("""
-**BTC · GOLD · KOSDAQ · M7 보수적 저가 판정**
-
-현재 ATH 대비 MDD를 **전체 가용 역사상 최대 MDD의 실제 바닥가격**과 비교합니다.
-MDD %p 차이가 아니라 가격 차이입니다.
-
-- 역사적 최악 바닥 대비 **+5% 이내 → 🔥 극단적 매수**
-- **+10% 이내 → 매우 싸다**
-- **+20% 이내 → 싸다**
-- **+35% 이내 → 관심**
-- 그 이상 → 보통
-
-예: 역사적 최대 MDD -50%, 현재 -45%라면 바닥 50 대비 현재 55이므로 **+10%**입니다.
-""")
-
-    st.caption("GOLD는 Yahoo Finance의 금 선물(GC=F)을 가격 프록시로 사용합니다.")
-
-    st.caption("KOSPI와 S&P500은 독립 계좌이며 세부 파라미터도 다릅니다. KOSPI는 -15%부터, S&P500은 -10%부터 하락 모드가 발동합니다. 현재 MDD가 아니라 사이클 최저 MDD를 기억하고, 박스권·회복 시에는 옛 전고점을 자동으로 리셋할 수 있습니다.")
+# 비주식 자산은 일별 percentile이 아니라 "독립 폭락 이벤트의 재현주기"로 판단합니다.
+# 같은 하락이 여러 날 이어져도 하나의 사건으로 묶고, 과거에 비슷하거나 더 심한 사건이
+# 평균 몇 년에 한 번 있었는지를 계산합니다. 사용자의 비주식 자산 확신이 낮으므로
+# 기본 알림 문턱은 1.5년(약 1~2년에 한 번 꼴)로 보수적으로 설정합니다.
+# start_dd는 '폭락 이벤트 시작'을 인식하기 위한 자산별 최소 낙폭입니다.
+CRASH_ASSETS = {
+    "미국 장기채": {"ticker": "TLT", "group": "채권", "proxy": "TLT", "start_dd": -0.05},
+    "금": {"ticker": "GC=F", "group": "원자재", "proxy": "금 선물", "start_dd": -0.075},
+    "은": {"ticker": "SI=F", "group": "원자재", "proxy": "은 선물", "start_dd": -0.12},
+    "구리": {"ticker": "HG=F", "group": "원자재", "proxy": "구리 선물", "start_dd": -0.12},
+    "브렌트유": {"ticker": "BZ=F", "group": "원자재", "proxy": "브렌트 선물", "start_dd": -0.15},
+    "BTC": {"ticker": "BTC-USD", "group": "코인", "proxy": "BTC", "start_dd": -0.20},
+    "ETH": {"ticker": "ETH-USD", "group": "코인", "proxy": "ETH", "start_dd": -0.25},
+}
 
 
-if st.button("🔄 최신 데이터 다시 받기"):
-    st.cache_data.clear()
-    st.rerun()
+# 8/16 캡처를 fallback으로 내장. Google Sheet를 못 읽을 때만 사용합니다.
+FALLBACK_PORTFOLIO = [
+    ("삼성전자", "005930", 349_987_500, 274_500, 1275),
+    ("SOL AI반도체소부장", "455850", 129_524_685, 23_955, 5407),
+    ("삼양식품", "003230", 63_500_000, 1_270_000, 50),
+    ("KB금융", "105560", 60_997_000, 168_500, 362),
+    ("메리츠금융지주", "138040", 59_166_900, 116_700, 507),
+    ("신세계", "004170", 58_499_000, 427_000, 137),
+    ("KT&G", "033780", 58_080_000, 176_000, 330),
+    ("한화오션", "042660", 57_671_600, 95_800, 602),
+    ("HD현대", "267250", 57_697_500, 235_500, 245),
+    ("파마리서치", "214450", 48_556_000, 398_000, 122),
+    ("HD현대중공업", "329180", 45_900_000, 510_000, 90),
+    ("에이피알", "278470", 42_955_000, 390_500, 110),
+    ("삼성전자우", "005935", 41_076_000, 195_600, 210),
+    ("한국금융지주", "071050", 29_580_000, 204_000, 145),
+    ("오라클", "ORCL", 10_660_353, 150.52, 50),
+    ("마이크론", "MU", 8_257_963, 971.66, 6),
+    ("블룸에너지", "BE", 8_142_578, 229.94, 25),
+    ("루멘텀", "LITE", 7_871_097, 926.14, 6),
+    ("코히어런트", "COHR", 6_922_926, 325.83, 15),
+    ("VIP펀드", "", 31_850_000, 2171, 0),
+    ("예수금", "", 38_420_000, np.nan, 0),
+]
 
 
-series = {}
-rows = []
+def _num(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return np.nan
+    s = str(v).strip().replace(",", "").replace("₩", "").replace("원", "")
+    s = s.replace("%", "")
+    if s in {"", "-", "—", "nan", "None", "#N/A", "#REF!", "#DIV/0!"}:
+        return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
-with st.spinner("시장 데이터를 불러오고 계산 중..."):
+
+def _clean_code(v):
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if s.lower() in {"nan", "none"}:
+        return ""
+    if re.fullmatch(r"\d+(?:\.0+)?", s):
+        s = s.split(".")[0]
+        return s.zfill(6)
+    return s.upper()
+
+
+def fallback_portfolio_df():
+    df = pd.DataFrame(FALLBACK_PORTFOLIO, columns=["종목", "코드", "평가금액", "현재가", "수량"])
+    total = df["평가금액"].sum()
+    df["비중"] = df["평가금액"] / total * 100
+    df["데이터원"] = "8/16 fallback"
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_google_portfolio(sheet_url: str, sheet_name: str):
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", sheet_url)
+    if not m:
+        raise ValueError("Google Sheet URL에서 문서 ID를 찾지 못했습니다.")
+    sid = m.group(1)
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
+    r = requests.get(csv_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    text = r.text
+    if "accounts.google.com" in text.lower() or "sign in" in text.lower():
+        raise PermissionError("시트가 링크 공개 상태가 아니어서 읽을 수 없습니다.")
+
+    raw = pd.read_csv(io.StringIO(text), header=None, dtype=str, keep_default_na=False)
+    header_row = None
+    for i in range(min(len(raw), 20)):
+        vals = [str(x).strip() for x in raw.iloc[i].tolist()]
+        if "종목" in vals and "비중" in vals:
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError("'종목'과 '비중' 헤더를 찾지 못했습니다. 시트 구조를 확인하세요.")
+
+    hdr = [str(x).strip() for x in raw.iloc[header_row].tolist()]
+    body = raw.iloc[header_row + 1:].reset_index(drop=True)
+
+    def idx(label):
+        try:
+            return hdr.index(label)
+        except ValueError:
+            return None
+
+    name_i = idx("종목")
+    code_i = idx("코드")
+    weight_i = idx("비중")
+    price_i = idx("현재가")
+    qty_i = idx("수량")
+    ret_i = idx("수익률")
+    value_i = weight_i - 1 if weight_i is not None and weight_i > 0 else None
+    if name_i is None or value_i is None:
+        raise ValueError("포트폴리오 핵심 열을 찾지 못했습니다.")
+
+    rows = []
+    for _, row in body.iterrows():
+        name = str(row.iloc[name_i]).strip() if name_i < len(row) else ""
+        if not name or name.lower() == "nan":
+            continue
+        # 시트 하단 보조 계산영역/설명행 제외
+        if name.lower() in {"pluto"} or name.startswith("cma+"):
+            continue
+        val = _num(row.iloc[value_i]) if value_i < len(row) else np.nan
+        if pd.isna(val) or val <= 0:
+            continue
+        code = _clean_code(row.iloc[code_i]) if code_i is not None and code_i < len(row) else ""
+        price = _num(row.iloc[price_i]) if price_i is not None and price_i < len(row) else np.nan
+        qty = _num(row.iloc[qty_i]) if qty_i is not None and qty_i < len(row) else 0
+        ret = _num(row.iloc[ret_i]) if ret_i is not None and ret_i < len(row) else np.nan
+        rows.append({"종목": name, "코드": code, "평가금액": val, "현재가": price, "수량": qty, "수익률": ret})
+
+    if not rows:
+        raise ValueError("유효한 보유종목 행을 찾지 못했습니다.")
+    df = pd.DataFrame(rows)
+    total = df["평가금액"].sum()
+    df["비중"] = df["평가금액"] / total * 100
+    df["데이터원"] = f"Google Sheet/{sheet_name}"
+    return df
+
+
+def load_portfolio_with_fallback(sheet_url, sheet_name):
+    try:
+        df = load_google_portfolio(sheet_url, sheet_name)
+        return df, None
+    except Exception as e:
+        return fallback_portfolio_df(), str(e)
+
+
+def classify_holding(name: str, code: str):
+    n = str(name).lower().replace(" ", "")
+    c = str(code).upper()
+    if "예수금" in n or n in {"cash", "현금"}:
+        return "현금", "현금"
+    if "vip" in n or "펀드" in n:
+        return "펀드", "기타"
+    if c in {"ORCL", "MU", "BE", "LITE", "COHR"}:
+        return "미국 AI", "미국"
+    if any(k in n for k in ["삼성전자", "반도체소부장", "반도체전공정"]):
+        return "반도체", "한국"
+    if any(k in n for k in ["kb금융", "메리츠금융", "한국금융"]):
+        return "금융", "한국"
+    if any(k in n for k in ["한화오션", "hd현대중공업", "hd현대"]):
+        return "조선/산업재", "한국"
+    if any(k in n for k in ["삼양식품", "신세계", "kt&g"]):
+        return "소비재", "한국"
+    if any(k in n for k in ["에이피알", "파마리서치"]):
+        return "뷰티/헬스", "한국"
+    if re.fullmatch(r"\d{6}", c):
+        return "기타 한국주", "한국"
+    return "기타", "기타"
+
+
+def enrich_portfolio(df):
+    out = df.copy()
+    cats = out.apply(lambda r: classify_holding(r["종목"], r["코드"]), axis=1)
+    out["분류"] = [x[0] for x in cats]
+    out["지역"] = [x[1] for x in cats]
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_core_market(percentile_years=5):
+    series = {}
+    rows = []
     for name, ticker in ALL.items():
         try:
             s = fetch_close(ticker)
@@ -858,269 +995,615 @@ with st.spinner("시장 데이터를 불러오고 계산 중..."):
             m = calc_metrics(s, name, percentile_years)
             m["자산"] = name
             rows.append(m)
-        except Exception as e:
-            st.warning(f"{name} 데이터를 불러오지 못했습니다: {e}")
-
-if not rows:
-    st.error("시장 데이터를 가져오지 못했습니다. 잠시 뒤 다시 시도하세요.")
-    st.stop()
-
-metrics = pd.DataFrame(rows).set_index("자산")
-macro_names = [x for x in MACRO if x in metrics.index]
-m7_names = [x for x in M7 if x in metrics.index]
-
-macro_df = metrics.loc[macro_names].copy()
-m7_df = metrics.loc[m7_names].copy()
-
-aux_rows = []
-for name in AUX_ASSETS:
-    if name in series:
-        x = all_history_drawdown_metrics(series[name])
-        if x:
-            x["자산"] = name
-            aux_rows.append(x)
-aux_df = pd.DataFrame(aux_rows).set_index("자산") if aux_rows else pd.DataFrame()
+        except Exception:
+            pass
+    metrics = pd.DataFrame(rows).set_index("자산") if rows else pd.DataFrame()
+    kospi_cash, kospi_reason, kospi_details = (np.nan, "데이터 없음", {})
+    sp_cash, sp_reason, sp_details = (np.nan, "데이터 없음", {})
+    if "KOSPI" in series:
+        kospi_cash, kospi_reason, kospi_details = standalone_cash_for_asset(series["KOSPI"], "KOSPI", percentile_years)
+    if "S&P500" in series:
+        sp_cash, sp_reason, sp_details = standalone_cash_for_asset(series["S&P500"], "S&P500", percentile_years)
+    return series, metrics, kospi_cash, kospi_reason, kospi_details, sp_cash, sp_reason, sp_details
 
 
-# SUMMARY — TWO INDEPENDENT CASH SLEEVES
-kospi_cash, kospi_reason, kospi_details = standalone_cash_for_asset(series["KOSPI"], "KOSPI", percentile_years) if "KOSPI" in series else (np.nan, "데이터 없음", {})
-sp_cash, sp_reason, sp_details = standalone_cash_for_asset(series["S&P500"], "S&P500", percentile_years) if "S&P500" in series else (np.nan, "데이터 없음", {})
-
-st.subheader("오늘의 독립 현금비중 추천")
-
-left, right = st.columns(2)
-
-with left:
-    st.markdown("### 🇰🇷 KOSPI 계좌")
-    st.metric("추천 현금", f"{kospi_cash:g}%" if pd.notna(kospi_cash) else "—")
-    if "KOSPI" in metrics.index:
-        r = metrics.loc["KOSPI"]
-        st.caption(
-            f"C-score {r['C-score']:.1f} · E-score {r['E-score']:.1f} · "
-            f"MDD {r['52주 MDD']:.1f}% · 50일 이격 {r['50일 이격']:.1f}%"
-        )
-        if kospi_details:
-            st.caption(f"낙폭 판정 {r['판정']} · 시장 상태 {regime_label(kospi_details.get('regime'))}")
-    st.info(kospi_reason)
-
-with right:
-    st.markdown("### 🇺🇸 S&P500 계좌")
-    st.metric("추천 현금", f"{sp_cash:g}%" if pd.notna(sp_cash) else "—")
-    if "S&P500" in metrics.index:
-        r = metrics.loc["S&P500"]
-        st.caption(
-            f"C-score {r['C-score']:.1f} · E-score {r['E-score']:.1f} · "
-            f"MDD {r['52주 MDD']:.1f}% · 50일 이격 {r['50일 이격']:.1f}%"
-        )
-        if sp_details:
-            st.caption(f"낙폭 판정 {r['판정']} · 시장 상태 {regime_label(sp_details.get('regime'))}")
-    st.info(sp_reason)
-
-st.caption(
-    "※ 두 숫자는 서로 완전히 독립적입니다. KOSPI용 자금 100, S&P500용 자금 100이 각각 있다고 가정합니다. "
-    "BTC·GOLD·KOSDAQ·M7의 움직임은 이 두 현금비중 계산에 영향을 주지 않습니다."
-)
+def _event_grade(return_period_years: float) -> str:
+    """Human-readable rarity grade. Signal threshold itself is user configurable."""
+    if pd.isna(return_period_years):
+        return "—"
+    if np.isinf(return_period_years) or return_period_years >= 10:
+        return "🔥 역사적 극단"
+    if return_period_years >= 5:
+        return "🔴 매우 드문 폭락"
+    if return_period_years >= 2.5:
+        return "🟠 큰 기회"
+    if return_period_years >= 1.5:
+        return "🟡 1~2년급 희귀 하락"
+    if return_period_years >= 1.0:
+        return "⚪ 관찰"
+    return "—"
 
 
-# MARKET CASH-ENGINE SIGNALS
-st.subheader("1) KOSPI / S&P500 — 현금 엔진 참고 신호")
-st.caption("※ 낙폭 판정은 C-score(MDD 깊이)이고, 시장 상태는 MA200 기울기·지속성으로 계산한 별도 Regime입니다. '하락 추세'라는 표현은 시장 상태에만 사용합니다.")
-market_names = [x for x in ["KOSPI", "S&P500"] if x in metrics.index]
-market_cols = ["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","판정","기준일"]
-market_show = metrics.loc[market_names, market_cols].copy()
-
-# C-score describes drawdown severity only. Regime is a separate trend-state signal.
-market_show = market_show.rename(columns={"판정": "낙폭 판정"})
-regime_map = {
-    "KOSPI": regime_label(kospi_details.get("regime")) if kospi_details else "—",
-    "S&P500": regime_label(sp_details.get("regime")) if sp_details else "—",
-}
-market_show.insert(7, "시장 상태", [regime_map.get(x, "—") for x in market_show.index])
-market_show = market_show[["현재가","52주 MDD","50일 이격","12개월 수익률","C-score","E-score","낙폭 판정","시장 상태","기준일"]]
-
-st.dataframe(
-    market_show.style.format({
-        "현재가": "{:,.2f}",
-        "52주 MDD": "{:.1f}%",
-        "50일 이격": "{:.1f}%",
-        "12개월 수익률": "{:.1f}%",
-        "C-score": "{:.1f}",
-        "E-score": "{:.1f}",
-    }, na_rep="—"),
-    use_container_width=True
-)
-
-st.subheader("2) BTC · GOLD · KOSDAQ · M7 — 역사적 MDD 저가 판정")
-st.caption(
-    "현금 추천에는 영향을 주지 않습니다. '역사적 바닥 대비 괴리'는 MDD %p 차이가 아니라, "
-    "각 drawdown의 직전 ATH를 100으로 놓았을 때 역사적 최악 바닥가격 대비 현재 가격이 몇 % 위인지 계산합니다."
-)
-if not aux_df.empty:
-    aux_show = aux_df[["현재가","ATH 대비 현재 MDD","역사적 최대 MDD","역사적 바닥 대비 괴리","판정","역사적 최대 MDD 날짜","기준일"]].copy()
-    aux_show = aux_show.sort_values("역사적 바닥 대비 괴리", ascending=True)
-    st.dataframe(
-        aux_show.style.format({
-            "현재가": "{:,.2f}",
-            "ATH 대비 현재 MDD": "{:.1f}%",
-            "역사적 최대 MDD": "{:.1f}%",
-            "역사적 바닥 대비 괴리": "+{:.1f}%",
-        }, na_rep="—"),
-        use_container_width=True
-    )
-else:
-    st.warning("보조자산 MDD 데이터를 계산하지 못했습니다.")
+def _format_return_period(x):
+    if pd.isna(x):
+        return "—"
+    if np.isinf(x):
+        return "관측기간 내 없음"
+    return f"{float(x):.1f}년"
 
 
-# DAY FREQUENCY
-st.subheader("3) MDD 발생확률 — 해당 하락폭에 있었던 거래일 비중")
-st.caption(
-    "예: -30%가 2%라면 선택한 기간 중 약 2%의 날에 가격이 최근 52주 고점보다 30% 이상 낮았습니다. "
-    "자산별 변동성 차이를 머릿속에 익히기 위한 표입니다."
-)
+def drawdown_event_metrics(close: pd.Series, start_dd: float, recovery_days: int = 15):
+    """
+    Treat one crash as one event.
 
-freq_rows = []
-for name in list(MACRO.keys()) + list(M7.keys()):
-    if name in series:
-        freq_rows.append({"자산": name, **mdd_day_frequency(series[name], freq_years)})
+    - Drawdown is measured versus the rolling 52-week high.
+    - An event begins when drawdown falls through the asset-specific start_dd.
+    - The event ends only after drawdown recovers above half of start_dd for
+      recovery_days consecutive observations. This hysteresis prevents one crash
+      from being counted over and over on consecutive days.
+    - Historical recurrence = observation years / number of CLOSED historical
+      events whose trough was at least as deep as today's drawdown.
 
-freq_df = pd.DataFrame(freq_rows).set_index("자산")
-st.dataframe(freq_df.style.format("{:.2f}%"), use_container_width=True)
+    The current ongoing event is never included in the historical denominator.
+    """
+    s = close.dropna().astype(float).sort_index()
+    if len(s) < 365 * 3:
+        return {
+            "현재 MDD": np.nan, "일별 폭락 percentile": np.nan, "ATH MDD": np.nan,
+            "현재 이벤트": False, "이벤트 시작일": "—", "현재 이벤트 최저 MDD": np.nan,
+            "과거 유사이상 이벤트": np.nan, "관측기간(년)": np.nan,
+            "평균 재현주기(년)": np.nan, "희귀도": "—", "기준일": "—",
+        }
 
+    high = s.rolling("365D", min_periods=60).max()
+    dd = (s / high - 1).dropna()
+    if dd.empty:
+        return {}
 
-# ENTRY FREQUENCY
-st.subheader("4) MDD 진입빈도 — 대략 얼마나 자주 그 선을 깨는가?")
-st.caption(
-    "같은 약세장에서 며칠 동안 -30% 아래에 머문 것을 매일 새 사건으로 세지 않고, "
-    "각 기준선을 위에서 아래로 새로 돌파한 횟수를 이용한 체감 빈도입니다."
-)
+    # Recovery threshold is deliberately much shallower than the event-start level.
+    # Examples: BTC -20% starts an event; it closes after staying above -10% for 15 observations.
+    recover_dd = float(start_dd) * 0.50
+    in_event = False
+    start_date = None
+    trough = np.nan
+    trough_date = None
+    recovery_count = 0
+    events = []
 
-entry_rows = []
-for name in list(MACRO.keys()) + list(M7.keys()):
-    if name in series:
-        entry_rows.append({"자산": name, **mdd_entry_frequency(series[name], freq_years)})
+    for dt, val in dd.items():
+        val = float(val)
+        if not in_event:
+            if val <= start_dd:
+                in_event = True
+                start_date = dt
+                trough = val
+                trough_date = dt
+                recovery_count = 0
+            continue
 
-entry_df = pd.DataFrame(entry_rows).set_index("자산")
-st.dataframe(entry_df, use_container_width=True)
+        if val < trough:
+            trough = val
+            trough_date = dt
 
+        if val >= recover_dd:
+            recovery_count += 1
+            if recovery_count >= recovery_days:
+                events.append({
+                    "start": start_date,
+                    "trough_date": trough_date,
+                    "trough_dd": float(trough),
+                    "end": dt,
+                })
+                in_event = False
+                start_date = None
+                trough = np.nan
+                trough_date = None
+                recovery_count = 0
+        else:
+            recovery_count = 0
 
-# BACKTEST
-st.subheader("5) KOSPI / S&P500 독립 현금룰 — 일별 Walk-forward 백테스트")
-st.caption(
-    "두 시장을 완전히 분리해서 검증합니다. KOSPI는 -15/-20/-30/-40%, S&P500은 -10/-15/-20/-30%에서 "
-    "1:2:3:4 누적 비율로 준비 현금을 투입합니다. MA200은 하루 돌파가 아니라 기울기·20일 지속성으로 레짐을 판정합니다. "
-    "신호는 매일 종가 기준, 다음 거래일에 적용하며 거래비용 10bp를 반영합니다."
-)
+    cur = float(dd.iloc[-1])
+    daily_pct = float((dd >= cur).mean() * 100)
+    ath_dd = float((s / s.cummax() - 1).iloc[-1])
+    years = max((dd.index[-1] - dd.index[0]).days / 365.25, 0.01)
 
-for asset in ["KOSPI", "S&P500"]:
-    if asset not in series:
-        continue
-
-    st.markdown(f"### {'🇰🇷' if asset == 'KOSPI' else '🇺🇸'} {asset}")
-
-    with st.spinner(f"{asset} 독립 현금룰 백테스트 계산 중..."):
-        bt_one, stats_one = run_standalone_cash_backtest(
-            series[asset],
-            asset,
-            percentile_years=percentile_years,
-            trading_cost_bps=10
-        )
-
-    if not stats_one.empty:
-        shown = stats_one.copy()
-        shown["CAGR"] *= 100
-        shown["MDD"] *= 100
-
-        st.dataframe(
-            shown.style.format({
-                "CAGR": "{:.1f}%",
-                "MDD": "{:.1f}%",
-                "Sharpe": "{:.2f}",
-                "Calmar": "{:.2f}",
-            }),
-            use_container_width=True
-        )
-
-        if not bt_one.empty:
-            recent = bt_one.dropna().tail(252)
-            st.caption(f"{asset} 최근 약 1년 일별 추천 현금비중")
-            st.line_chart(recent["cash"])
-
-            # Useful debug table: lets the user inspect historical turning points.
-            st.caption(f"{asset} 최근 20거래일 신호")
-            debug = recent[["cash", "reserve_cash", "used_frac", "mdd_pct", "c", "e"]].tail(20).copy()
-            debug["used_frac"] *= 100
-            debug.columns = ["추천 현금", "시작 현금", "누적 투입률", "MDD", "C-score", "E-score"]
-            st.dataframe(
-                debug.style.format({
-                    "추천 현금": "{:.1f}%",
-                    "시작 현금": "{:.1f}%",
-                    "누적 투입률": "{:.0f}%",
-                    "MDD": "{:.1f}%",
-                    "C-score": "{:.1f}",
-                    "E-score": "{:.1f}",
-                }),
-                use_container_width=True
-            )
+    # Compare today's depth with closed historical event troughs only.
+    historical_depths = np.array([e["trough_dd"] for e in events], dtype=float)
+    if historical_depths.size:
+        similar_or_worse = int(np.sum(historical_depths <= cur))
     else:
-        st.warning(f"{asset} 백테스트 데이터가 충분하지 않습니다.")
+        similar_or_worse = 0
 
-st.markdown("""
-**시장별 독립 현금룰**
+    if similar_or_worse == 0:
+        return_period = np.inf if cur <= start_dd else np.nan
+    else:
+        return_period = years / similar_or_worse
 
-**KOSPI**
-- 상승/박스/하락 기본 현금: **10% / 15% / 20%**
-- 하락 모드 시작: **로컬 고점 대비 -15%**
-- 준비 현금 투입: **-15 / -20 / -30 / -40% → 누적 10 / 30 / 60 / 100%**
-- 회복 확인: 50일선 회복 + 50일선 상승 + 저점 대비 5% 이상 반등 + 하락 레짐 아님
-- 박스 안정화가 이어지면 전고점 회복 전에도 새 로컬 고점으로 사이클 리셋
+    active = bool(in_event and cur <= recover_dd)
+    # If the event has materially recovered, do not keep shouting even before the
+    # 15-day closure confirmation is complete.
+    if not active:
+        return_period_for_signal = np.nan
+    else:
+        return_period_for_signal = return_period
 
-**S&P500**
-- 상승/박스/하락 기본 현금: **5% / 10% / 15%**
-- 하락 모드 시작: **로컬 고점 대비 -10%**
-- 준비 현금 투입: **-10 / -15 / -20 / -30% → 누적 10 / 30 / 60 / 100%**
-- E-score가 매우 높아질 때도 KOSPI보다 더 높은 임계값을 요구해 현금 드래그를 줄임
-- 회복/현금 재축적 속도도 KOSPI보다 느리게 설정
+    return {
+        "현재 MDD": cur * 100,
+        "일별 폭락 percentile": daily_pct,
+        "ATH MDD": ath_dd * 100,
+        "현재 이벤트": active,
+        "이벤트 시작일": str(pd.Timestamp(start_date).date()) if in_event and start_date is not None else "—",
+        "현재 이벤트 최저 MDD": float(trough) * 100 if in_event and pd.notna(trough) else np.nan,
+        "과거 유사이상 이벤트": similar_or_worse,
+        "관측기간(년)": years,
+        "평균 재현주기(년)": return_period_for_signal,
+        "희귀도": _event_grade(return_period_for_signal),
+        "기준일": str(dd.index[-1].date()),
+    }
 
-**공통 구조**
-- 현재 MDD가 아니라 **이번 사이클 최저 MDD**를 기억하는 래칫 방식
-- 하락 중 반등했다고 이미 투자한 돈을 다시 현금으로 되돌리지 않음
-- MA200은 단순 상·하회가 아니라 **60일 기울기 + 최근 20일 하회 일수**로 상승/박스/하락 레짐 판정
-- E가 식어도 현금을 하루 만에 확 줄이지 않고 **2.5%p씩 천천히 해제**
-- 폭락 후 박스권에서는 시장별 현금 바닥까지 **2.5%p씩 천천히 재축적**
-- 깊은 MDD에서는 최종적으로 **현금 0%까지 허용**
+
+def suggested_cross_asset_weight(return_period_years: float, each_cap: float) -> float:
+    """Very conservative sizing because these are outside the user's core stock expertise."""
+    if pd.isna(return_period_years):
+        return 0.0
+    if np.isinf(return_period_years) or return_period_years >= 8:
+        raw = 1.5
+    elif return_period_years >= 4:
+        raw = 1.0
+    elif return_period_years >= 1.5:
+        raw = 0.5
+    else:
+        raw = 0.0
+    return float(min(raw, each_cap))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def crash_radar_table():
+    rows = []
+    for name, meta in CRASH_ASSETS.items():
+        try:
+            s = fetch_close(meta["ticker"])
+            x = drawdown_event_metrics(s, meta["start_dd"])
+            x.update({
+                "자산": name,
+                "그룹": meta["group"],
+                "신호 프록시": meta["proxy"],
+                "이벤트 시작 기준": meta["start_dd"] * 100,
+            })
+            rows.append(x)
+        except Exception:
+            rows.append({
+                "자산": name, "그룹": meta["group"], "신호 프록시": meta["proxy"],
+                "이벤트 시작 기준": meta["start_dd"] * 100,
+                "현재 MDD": np.nan, "일별 폭락 percentile": np.nan, "ATH MDD": np.nan,
+                "현재 이벤트": False, "이벤트 시작일": "—", "현재 이벤트 최저 MDD": np.nan,
+                "과거 유사이상 이벤트": np.nan, "관측기간(년)": np.nan,
+                "평균 재현주기(년)": np.nan, "희귀도": "—", "기준일": "—",
+            })
+    return pd.DataFrame(rows).set_index("자산")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def latest_price(ticker: str):
+    s = fetch_close(ticker)
+    return float(s.iloc[-1]), str(s.index[-1].date())
+
+
+def portfolio_cash_target(portfolio, kospi_cash, sp_cash):
+    kr = portfolio.loc[portfolio["지역"] == "한국", "평가금액"].sum()
+    us = portfolio.loc[portfolio["지역"] == "미국", "평가금액"].sum()
+    risk = kr + us
+    if risk <= 0:
+        return np.nan
+    parts = 0.0
+    denom = 0.0
+    if pd.notna(kospi_cash) and kr > 0:
+        parts += kr * kospi_cash
+        denom += kr
+    if pd.notna(sp_cash) and us > 0:
+        parts += us * sp_cash
+        denom += us
+    return parts / denom if denom > 0 else np.nan
+
+
+def find_row_by_name(df, wanted):
+    wanted_key = wanted.lower().replace(" ", "")
+    mask = df["종목"].astype(str).str.lower().str.replace(" ", "", regex=False).str.contains(wanted_key, regex=False)
+    if mask.any():
+        return df.loc[mask].iloc[0]
+    return None
+
+
+def tactical_orders(portfolio, total_value, target_price, min_trade_krw=5_000_000):
+    target_code = TACTICAL_PLAN["code"]
+    target_mask = (portfolio["코드"].astype(str) == target_code) | portfolio["종목"].astype(str).str.contains("반도체전공정", na=False)
+    current_value = float(portfolio.loc[target_mask, "평가금액"].sum())
+    current_weight = current_value / total_value * 100 if total_value > 0 else 0
+    gap_pp = max(0.0, TACTICAL_PLAN["target_weight"] - current_weight)
+    desired = total_value * gap_pp / 100
+    if desired < min_trade_krw:
+        return pd.DataFrame(), current_weight, desired
+
+    funding_total_pp = sum(x[1] for x in TACTICAL_PLAN["funding"])
+    orders = []
+    proceeds = 0.0
+    for name, cap_pp in TACTICAL_PLAN["funding"]:
+        r = find_row_by_name(portfolio, name)
+        if r is None:
+            continue
+        desired_sell = desired * cap_pp / funding_total_pp
+        price = float(r["현재가"]) if pd.notna(r["현재가"]) and r["현재가"] > 0 else np.nan
+        held_qty = int(r["수량"]) if pd.notna(r["수량"]) else 0
+        if pd.notna(price) and held_qty > 0:
+            shares = int(min(held_qty, np.floor(desired_sell / price)))
+            amount = shares * price
+        else:
+            shares = 0
+            amount = min(desired_sell, float(r["평가금액"]))
+        if amount >= min_trade_krw / 4:
+            proceeds += amount
+            orders.append({"구분": "매도", "종목": r["종목"], "수량": shares if shares > 0 else "—", "예상금액": amount})
+
+    if pd.notna(target_price) and target_price > 0 and proceeds > 0:
+        buy_shares = int(np.floor(proceeds / target_price))
+        buy_amount = buy_shares * target_price
+    else:
+        buy_shares = "—"
+        buy_amount = proceeds
+    if proceeds > 0:
+        orders.append({"구분": "매수", "종목": TACTICAL_PLAN["name"], "수량": buy_shares, "예상금액": buy_amount})
+    return pd.DataFrame(orders), current_weight, desired
+
+
+def build_daily_advice(portfolio, kospi_cash, sp_cash, crash_df, min_return_period_years, cross_asset_each_pct, cross_asset_max_pct):
+    total = float(portfolio["평가금액"].sum())
+    cash_value = float(portfolio.loc[portfolio["분류"] == "현금", "평가금액"].sum())
+    cash_pct = cash_value / total * 100 if total else np.nan
+    target_cash = portfolio_cash_target(portfolio, kospi_cash, sp_cash)
+    messages = []
+
+    if pd.notna(target_cash) and pd.notna(cash_pct):
+        gap = target_cash - cash_pct
+        if gap >= 2.5:
+            messages.append(("현금", "🔴", f"시장 엔진 기준 혼합 현금이 약 {target_cash:.1f}%인데 실제 예수금은 {cash_pct:.1f}%입니다. 약 {gap:.1f}%p 현금 확보가 우선입니다."))
+        elif gap <= -2.5:
+            messages.append(("현금", "🟢", f"시장 엔진 기준 혼합 현금은 약 {target_cash:.1f}%이고 실제 예수금은 {cash_pct:.1f}%입니다. 현금이 약 {-gap:.1f}%p 더 많아 신규매수 여력이 있습니다."))
+        else:
+            messages.append(("현금", "⚪", f"실제 예수금 {cash_pct:.1f}%는 시장 엔진 혼합 현금 {target_cash:.1f}%와 큰 차이가 없습니다."))
+
+    # 집중도: 사용자가 반도체 고비중을 의도적으로 운용하므로 '강제 매도'가 아니라 경고만.
+    single = portfolio[~portfolio["분류"].isin(["현금", "펀드"])].sort_values("비중", ascending=False).head(1)
+    if not single.empty and float(single.iloc[0]["비중"]) >= 30:
+        r = single.iloc[0]
+        messages.append(("집중도", "🟡", f"{r['종목']} 단일종목 비중이 {r['비중']:.1f}%로 30%를 넘었습니다. 신규매수보다 다른 기회를 우선하는 편이 낫습니다."))
+
+    semi_names = ["삼성전자", "삼성전자우", "SOL AI반도체소부장", "SOL 반도체전공정", "마이크론"]
+    semi_mask = portfolio["종목"].astype(str).apply(lambda x: any(k.lower().replace(" ", "") in x.lower().replace(" ", "") for k in semi_names))
+    semi_pct = portfolio.loc[semi_mask, "평가금액"].sum() / total * 100 if total else 0
+    if semi_pct >= 50:
+        messages.append(("집중도", "🔴", f"반도체 직접 노출이 약 {semi_pct:.1f}%입니다. 전공정 추가보다 반도체 총량 관리가 우선입니다."))
+    elif semi_pct >= 45:
+        messages.append(("집중도", "🟡", f"반도체 직접 노출이 약 {semi_pct:.1f}%입니다. 추가 편입은 50% 상한을 넘기지 않는 범위가 좋습니다."))
+
+    if crash_df is not None and not crash_df.empty:
+        rp = pd.to_numeric(crash_df["평균 재현주기(년)"], errors="coerce")
+        active = crash_df["현재 이벤트"].fillna(False).astype(bool)
+        triggered = crash_df[active & (rp >= min_return_period_years)].copy()
+    else:
+        triggered = pd.DataFrame()
+
+    if not triggered.empty:
+        allocs = []
+        for _, r in triggered.iterrows():
+            allocs.append(suggested_cross_asset_weight(r["평균 재현주기(년)"], cross_asset_each_pct))
+        total_alloc = min(cross_asset_max_pct, sum(allocs))
+        assets = ", ".join(triggered.index.tolist())
+        messages.append(("폭락자산", "🔥", f"{assets}에서 독립 폭락 이벤트가 발생했습니다. 과거 재현주기가 최소 {min_return_period_years:.1f}년 이상인 구간만 잡은 신호이며, 비주식 자산은 합계 {total_alloc:.1f}%p 이내의 소액 분산만 검토합니다."))
+    else:
+        messages.append(("폭락자산", "⚪", f"채권·원자재·코인 중 평균 {min_return_period_years:.1f}년에 한 번 이하로 드문 독립 폭락 이벤트는 없습니다. → 아무것도 하지 않음"))
+    return messages, target_cash, cash_pct, triggered
+
+
+def money(x):
+    if pd.isna(x):
+        return "—"
+    x = float(x)
+    if abs(x) >= 100_000_000:
+        return f"{x/100_000_000:.2f}억"
+    return f"{x/10_000:.0f}만"
+
+
+def render_portfolio_page(portfolio, market_pack, crash_df, settings):
+    series, metrics, kospi_cash, kospi_reason, kospi_details, sp_cash, sp_reason, sp_details = market_pack
+    total = float(portfolio["평가금액"].sum())
+    advice, blend_cash, cash_pct, triggered = build_daily_advice(
+        portfolio, kospi_cash, sp_cash, crash_df,
+        settings["min_return_period_years"], settings["cross_asset_each_pct"], settings["cross_asset_max_pct"]
+    )
+
+    st.title("🧭 Portfolio OS")
+    st.caption("Google Sheet의 최신 보유내역 + 기존 Market Distress Radar를 한 화면에서 연결합니다. 대부분의 날에는 '아무것도 안 함'이 정상입니다.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("총 포트", money(total))
+    c2.metric("예수금", f"{cash_pct:.1f}%" if pd.notna(cash_pct) else "—")
+    c3.metric("KOSPI 추천 현금", f"{kospi_cash:g}%" if pd.notna(kospi_cash) else "—")
+    c4.metric("S&P500 추천 현금", f"{sp_cash:g}%" if pd.notna(sp_cash) else "—")
+
+    st.subheader("오늘의 조언")
+    for _, icon, msg in advice:
+        if icon in {"🔴", "🔥"}:
+            st.warning(f"{icon} {msg}")
+        elif icon == "🟢":
+            st.success(f"{icon} {msg}")
+        else:
+            st.info(f"{icon} {msg}")
+
+    st.subheader("전술 리밸런싱 — SOL 반도체전공정 목표 3.5%")
+    try:
+        target_price, target_date = latest_price(TACTICAL_PLAN["ticker"])
+    except Exception:
+        target_price, target_date = np.nan, "—"
+    orders, current_tw, desired = tactical_orders(portfolio, total, target_price, settings["min_trade_krw"])
+    if orders.empty:
+        st.success(f"현재 전공정 비중 {current_tw:.2f}% — 목표 3.5%와의 차이가 최소 거래기준보다 작아 추가 주문 없음.")
+    else:
+        st.caption(f"현재 전공정 {current_tw:.2f}% → 목표 3.5% · 목표 ETF 최근가 {target_price:,.0f}원 ({target_date})" if pd.notna(target_price) else f"현재 전공정 {current_tw:.2f}% → 목표 3.5%")
+        show_orders = orders.copy()
+        st.dataframe(show_orders.style.format({"예상금액": "{:,.0f}원"}), use_container_width=True, hide_index=True)
+        st.caption("매일 시트 비중을 다시 읽어 목표에 가까워질수록 주문 제안이 자동으로 줄어듭니다. 최소 거래금액 이하이면 아무 거래도 제안하지 않습니다.")
+
+    st.subheader("현재 포트")
+    pshow = portfolio[["종목", "코드", "평가금액", "비중", "수량", "분류", "지역"]].sort_values("평가금액", ascending=False).copy()
+    st.dataframe(pshow.style.format({"평가금액": "{:,.0f}원", "비중": "{:.2f}%", "수량": "{:,.0f}"}, na_rep="—"), use_container_width=True, hide_index=True)
+
+    st.subheader("분류별 비중")
+    cat = portfolio.groupby("분류", as_index=False)["평가금액"].sum()
+    cat["비중"] = cat["평가금액"] / total * 100
+    cat = cat.sort_values("비중", ascending=False)
+    st.bar_chart(cat.set_index("분류")["비중"])
+    st.dataframe(cat.style.format({"평가금액": "{:,.0f}원", "비중": "{:.1f}%"}), use_container_width=True, hide_index=True)
+
+    if not triggered.empty:
+        st.subheader("🔥 지금만 뜨는 비주식 폭락 기회")
+        show = triggered[["그룹", "현재 MDD", "현재 이벤트 최저 MDD", "평균 재현주기(년)", "과거 유사이상 이벤트", "관측기간(년)", "희귀도", "신호 프록시", "이벤트 시작일"]].copy()
+        show["권고 비중"] = [suggested_cross_asset_weight(x, settings["cross_asset_each_pct"]) for x in show["평균 재현주기(년)"]]
+        st.dataframe(
+            show.style.format({
+                "현재 MDD": "{:.1f}%",
+                "현재 이벤트 최저 MDD": "{:.1f}%",
+                "평균 재현주기(년)": lambda x: _format_return_period(x),
+                "관측기간(년)": "{:.1f}",
+                "권고 비중": "{:.1f}%p",
+            }, na_rep="—"),
+            use_container_width=True,
+        )
+        st.caption(
+            f"같은 폭락이 며칠 이어져도 하나의 이벤트로 묶습니다. 기본 알림은 평균 {settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 사건부터. "
+            f"비주식 전체 신규배분은 최대 {settings['cross_asset_max_pct']:.1f}%p까지만 허용합니다."
+        )
+
+
+
+def render_market_page(market_pack, percentile_years, freq_years):
+    series, metrics, kospi_cash, kospi_reason, kospi_details, sp_cash, sp_reason, sp_details = market_pack
+    st.title("📉 Market Distress Radar")
+    st.caption("기존 v8 로직을 그대로 유지했습니다. KOSPI/S&P500 현금 엔진과 BTC·GOLD·KOSDAQ·M7 저가 판정은 서로 분리됩니다.")
+    if metrics.empty:
+        st.error("시장 데이터를 가져오지 못했습니다.")
+        return
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### 🇰🇷 KOSPI")
+        st.metric("추천 현금", f"{kospi_cash:g}%" if pd.notna(kospi_cash) else "—")
+        st.info(kospi_reason)
+    with right:
+        st.markdown("### 🇺🇸 S&P500")
+        st.metric("추천 현금", f"{sp_cash:g}%" if pd.notna(sp_cash) else "—")
+        st.info(sp_reason)
+
+    st.subheader("KOSPI / S&P500 현금 엔진 참고 신호")
+    names = [x for x in ["KOSPI", "S&P500"] if x in metrics.index]
+    market_show = metrics.loc[names, ["현재가", "52주 MDD", "50일 이격", "12개월 수익률", "C-score", "E-score", "판정", "기준일"]].copy()
+    market_show = market_show.rename(columns={"판정": "낙폭 판정"})
+    regime_map = {
+        "KOSPI": regime_label(kospi_details.get("regime")) if kospi_details else "—",
+        "S&P500": regime_label(sp_details.get("regime")) if sp_details else "—",
+    }
+    market_show["시장 상태"] = [regime_map.get(x, "—") for x in market_show.index]
+    st.dataframe(market_show.style.format({"현재가": "{:,.2f}", "52주 MDD": "{:.1f}%", "50일 이격": "{:.1f}%", "12개월 수익률": "{:.1f}%", "C-score": "{:.1f}", "E-score": "{:.1f}"}, na_rep="—"), use_container_width=True)
+
+    st.subheader("BTC · GOLD · KOSDAQ · M7 — 역사적 MDD 저가 판정")
+    aux_rows = []
+    for name in AUX_ASSETS:
+        if name in series:
+            x = all_history_drawdown_metrics(series[name])
+            if x:
+                x["자산"] = name
+                aux_rows.append(x)
+    aux_df = pd.DataFrame(aux_rows).set_index("자산") if aux_rows else pd.DataFrame()
+    if not aux_df.empty:
+        show = aux_df[["현재가", "ATH 대비 현재 MDD", "역사적 최대 MDD", "역사적 바닥 대비 괴리", "판정", "역사적 최대 MDD 날짜", "기준일"]].sort_values("역사적 바닥 대비 괴리")
+        st.dataframe(show.style.format({"현재가": "{:,.2f}", "ATH 대비 현재 MDD": "{:.1f}%", "역사적 최대 MDD": "{:.1f}%", "역사적 바닥 대비 괴리": "+{:.1f}%"}, na_rep="—"), use_container_width=True)
+
+    st.subheader("MDD 발생확률")
+    freq_rows = []
+    for name in list(MACRO.keys()) + list(M7.keys()):
+        if name in series:
+            freq_rows.append({"자산": name, **mdd_day_frequency(series[name], freq_years)})
+    if freq_rows:
+        freq_df = pd.DataFrame(freq_rows).set_index("자산")
+        st.dataframe(freq_df.style.format("{:.2f}%"), use_container_width=True)
+
+    st.subheader("MDD 진입빈도")
+    entry_rows = []
+    for name in list(MACRO.keys()) + list(M7.keys()):
+        if name in series:
+            entry_rows.append({"자산": name, **mdd_entry_frequency(series[name], freq_years)})
+    if entry_rows:
+        st.dataframe(pd.DataFrame(entry_rows).set_index("자산"), use_container_width=True)
+
+    with st.expander("Walk-forward 백테스트 보기", expanded=False):
+        for asset in ["KOSPI", "S&P500"]:
+            if asset not in series:
+                continue
+            st.markdown(f"### {asset}")
+            bt, stats = run_standalone_cash_backtest(series[asset], asset, percentile_years=percentile_years, trading_cost_bps=10)
+            if not stats.empty:
+                shown = stats.copy(); shown["CAGR"] *= 100; shown["MDD"] *= 100
+                st.dataframe(shown.style.format({"CAGR": "{:.1f}%", "MDD": "{:.1f}%", "Sharpe": "{:.2f}", "Calmar": "{:.2f}"}), use_container_width=True)
+                if not bt.empty:
+                    st.line_chart(bt["cash"].tail(252))
+
+
+def render_crash_page(crash_df, settings):
+    st.title("🚨 비주식 폭락 이벤트 레이더")
+    st.caption(
+        "채권·원자재·코인은 일별 99 percentile 대신 독립적인 폭락 사건으로 묶습니다. "
+        "현재 낙폭과 같거나 더 심했던 과거 사건이 평균 몇 년에 한 번 있었는지를 계산하고, "
+        f"{settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 사건부터만 🔔 신호를 냅니다."
+    )
+
+    df = crash_df.copy()
+    rp = pd.to_numeric(df["평균 재현주기(년)"], errors="coerce")
+    active = df["현재 이벤트"].fillna(False).astype(bool)
+    df["신호"] = np.where(active & (rp >= settings["min_return_period_years"]), "🔔 검토", "—")
+    # Infinity should sort first; NaN last.
+    df["_sort"] = rp.replace(np.inf, 1e9)
+    df = df.sort_values(["신호", "_sort"], ascending=[True, False]).drop(columns="_sort")
+
+    show_cols = [
+        "그룹", "신호 프록시", "현재 MDD", "현재 이벤트 최저 MDD", "일별 폭락 percentile",
+        "과거 유사이상 이벤트", "관측기간(년)", "평균 재현주기(년)", "희귀도", "신호", "이벤트 시작일", "기준일"
+    ]
+    st.dataframe(
+        df[show_cols].style.format({
+            "현재 MDD": "{:.1f}%",
+            "현재 이벤트 최저 MDD": "{:.1f}%",
+            "일별 폭락 percentile": "{:.1f}",
+            "관측기간(년)": "{:.1f}",
+            "평균 재현주기(년)": lambda x: _format_return_period(x),
+        }, na_rep="—"),
+        use_container_width=True,
+    )
+
+    triggered = df[active & (rp >= settings["min_return_period_years"])]
+    if triggered.empty:
+        st.info(
+            f"현재 평균 {settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 비주식 폭락 이벤트가 없습니다. → 아무것도 하지 않음"
+        )
+    else:
+        st.warning("신호가 켜져도 비주식 자산은 작은 비중만 허용합니다. 희귀할수록 비중을 조금 늘리되 한 자산 상한과 전체 상한을 지킵니다.")
+        total_suggested = 0.0
+        for name, r in triggered.iterrows():
+            suggested = suggested_cross_asset_weight(r["평균 재현주기(년)"], settings["cross_asset_each_pct"])
+            total_suggested += suggested
+            rp_txt = _format_return_period(r["평균 재현주기(년)"])
+            st.markdown(
+                f"**{name}** · 현재 MDD {r['현재 MDD']:.1f}% · 과거 유사/이상 사건 {int(r['과거 유사이상 이벤트'])}회 / {r['관측기간(년)']:.1f}년 "
+                f"→ **평균 {rp_txt}에 한 번** · {r['희귀도']} · **총자산 {suggested:.1f}%p 검토**"
+            )
+        st.caption(
+            f"동시 신호 합산 제안 {min(total_suggested, settings['cross_asset_max_pct']):.1f}%p, 전체 상한 {settings['cross_asset_max_pct']:.1f}%p. "
+            "원자재는 선물가격을 신호로만 사용하며 PTP/세금/롤오버 때문에 실제 상품은 자동 지정하지 않습니다."
+        )
+
+    st.markdown("""
+**이벤트 계산 방식**  
+- 자산별 최소 낙폭을 넘으면 폭락 이벤트 시작  
+- 이후 충분히 회복한 상태가 15거래일(코인은 15관측일) 이어져야 이벤트 종료  
+- 같은 하락장에서 며칠씩 99 percentile이 반복되어도 **한 사건으로만 계산**  
+- 현재 낙폭과 같거나 더 깊었던 **종료된 과거 사건 수**로 평균 재현주기를 계산  
+- 현재 진행 중인 사건은 과거 횟수에 포함하지 않음
+
+`일별 폭락 percentile`은 참고용으로만 남겨두고 **알림 여부에는 사용하지 않습니다.**
 """)
 
-# EXPLANATION
-st.subheader("6) 해석")
-st.markdown("""
-**C-score**  
-절대 MDD 기반의 낙폭 점수이며 **KOSPI와 S&P500 현금 엔진용 참고지표**입니다. 가치평가가 아니라 하락 깊이를 봅니다.  
-KOSPI는 기존 절대 MDD 기준을 유지하고, **S&P500은 더 낮은 변동성을 반영해 같은 MDD를 더 높은 C-score로 평가**합니다.
 
-**BTC · GOLD · KOSDAQ · M7 저가 판정**  
-C-score를 쓰지 않습니다. 전체 가용 가격 역사에서 `현재 ATH MDD`와 `역사적 최대 ATH MDD`를 구한 뒤, **역사적 최악 바닥가격 대비 현재 가격의 실제 괴리율**로 판정합니다.  
-보수적으로 **+5% 이내만 극단적 매수**, +10% 이내 매우 싸다, +20% 이내 싸다, +35% 이내 관심으로 표시합니다. 이 신호들은 KOSPI/S&P500 현금비중에 영향을 주지 않습니다.
+def render_settings_page(settings):
+    st.title("⚙️ 설정 / 규칙")
+    st.markdown(f"""
+### 포트 데이터
+- Google Sheet: `{settings['sheet_url']}`
+- 탭 이름: `{settings['sheet_name']}`
+- 5분 캐시 후 자동 재조회
 
-**E-score**  
-`12개월 수익률 percentile × 60% + 50일 이격 percentile × 40%`입니다. 과열 시 탄약을 만드는 보조 신호입니다.  
-KOSPI와 S&P500의 E→현금 매핑도 다르며, S&P500은 더 극단적인 E에서만 큰 현금비중을 권합니다.
+### 비주식 폭락 이벤트 규칙
+- 알림 문턱: **평균 {settings['min_return_period_years']:.1f}년에 한 번 이하로 드문 사건부터**
+- 같은 하락이 여러 날 이어져도 **1개의 이벤트로 묶음**
+- 이벤트 종료: 충분한 회복 상태가 **15관측일 연속** 확인될 때
+- 일별 MDD percentile은 참고용이며 **알림 조건에는 사용하지 않음**
+- 1.5~4년급: 기본 **0.5%p** 검토
+- 4~8년급: 기본 **1.0%p** 검토
+- 8년+ 또는 관측기간 내 전례 없음: 기본 **1.5%p** 검토
+- 한 자산 최대 **{settings['cross_asset_each_pct']:.1f}%p**
+- 동시 신호 전체 최대 **{settings['cross_asset_max_pct']:.1f}%p**
+- 원자재는 선물가격을 신호로만 사용하고 실제 매수상품 자동 추천은 하지 않음
 
-**Regime**  
-200일선을 하루 이틀 깼는지는 중요하게 보지 않습니다. **200일선 60일 기울기와 최근 20일 동안 200일선 아래에 있었던 일수**를 함께 사용해 상승/박스/하락을 구분합니다.
+### 포트 리밸런싱 규칙
+- 최소 거래금액: **{money(settings['min_trade_krw'])}**
+- SOL 반도체전공정 전술 목표: **3.5%**
+- 목표 조달원: SOL AI소부장 1.5%p / APR 0.8%p / 삼양식품 0.7%p / 신세계 0.5%p
+- 반도체 총 노출 45%부터 경고, 50%부터 추가편입 제한 경고
 
-**Path-dependent MDD**  
-현금 추천은 오늘의 52주 MDD만 보고 매일 초기화하지 않습니다. 한 번 하락 모드가 시작되면 **그 사이클에서 실제로 찍었던 최저 MDD**를 기억합니다. 바닥 -30% 후 현재 -23%로 반등해도 -30% 단계에서 이미 집행한 매수는 되돌리지 않습니다.
-
-**Recovery / Reset**  
-50일선 회복·상승과 저점 대비 반등이 확인되면 남은 현금 일부를 추가 투자합니다. 또한 전고점을 끝내 회복하지 못해도 박스권 안정화가 충분히 지속되면 옛 전고점을 버리고 새로운 로컬 고점을 기준으로 다음 사이클을 시작합니다.
-
-**현금 재축적**  
-폭락 후 현금이 거의 0%가 된 상태에서 박스권으로 넘어가도 현금을 하루 만에 10~20%로 만들지 않습니다. 시장별 속도로 **2.5%p씩 점진적으로** 탄약을 다시 만듭니다.
-
-추천값은 기계적 기준선입니다. 실제 운용에서는 포트폴리오 상황과 시장 해석에 따라 수동 조정할 수 있습니다.
+### 기존 Market Distress Radar
+- KOSPI와 S&P500 현금 엔진은 v8 로직 그대로
+- C-score = 절대 MDD
+- E-score = 12개월 수익률 percentile 60% + 50일 이격 percentile 40%
+- BTC/GOLD/KOSDAQ/M7 저가판정은 현금비중에 영향 없음
 """)
 
-st.warning(
-    "이 대시보드는 투자 의사결정 보조도구입니다. "
-    "Yahoo Finance 데이터 오류·지연 가능성이 있으며, 백테스트는 세금·슬리피지·실제 ETF 비용을 완전히 반영하지 않습니다."
-)
+
+
+# =========================================================
+# UI — LEFT NAVIGATION
+# =========================================================
+with st.sidebar:
+    st.title("🧭 Portfolio OS")
+    page = st.radio("메뉴", ["🏠 내 포트", "📉 시장 레이더", "🚨 폭락 자산", "⚙️ 설정/설명"], label_visibility="collapsed")
+    st.divider()
+    percentile_years = st.selectbox("E-score 비교기간", [3, 5, 10], index=1, format_func=lambda x: f"최근 {x}년")
+    freq_choice = st.selectbox("MDD 빈도표", ["최근 5년", "최근 10년", "전체 가용기간"], index=2)
+    freq_years = {"최근 5년": 5, "최근 10년": 10, "전체 가용기간": None}[freq_choice]
+    st.divider()
+    sheet_url = st.text_input("포트 Google Sheet", value=DEFAULT_SHEET_URL)
+    sheet_name = st.text_input("포트 탭 이름", value=DEFAULT_SHEET_NAME)
+    min_return_period_years = st.slider("비주식 알림 최소 재현주기", 1.0, 10.0, 1.5, 0.5, format="%.1f년")
+    cross_asset_each_pct = st.slider("비주식 1자산 최대 비중", 0.5, 2.0, 1.5, 0.5)
+    cross_asset_max_pct = st.slider("비주식 신호 전체 최대 비중", 1.0, 6.0, 3.0, 0.5)
+    min_trade_krw = st.select_slider("최소 리밸런싱 금액", options=[1_000_000, 3_000_000, 5_000_000, 7_000_000, 10_000_000], value=5_000_000, format_func=lambda x: f"{x/10_000:.0f}만원")
+    if st.button("🔄 모든 데이터 새로고침", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+settings = {
+    "sheet_url": sheet_url,
+    "sheet_name": sheet_name,
+    "min_return_period_years": min_return_period_years,
+    "cross_asset_each_pct": cross_asset_each_pct,
+    "cross_asset_max_pct": cross_asset_max_pct,
+    "min_trade_krw": min_trade_krw,
+}
+
+portfolio_raw, portfolio_error = load_portfolio_with_fallback(sheet_url, sheet_name)
+portfolio = enrich_portfolio(portfolio_raw)
+market_pack = load_core_market(percentile_years)
+crash_df = crash_radar_table()
+
+if portfolio_error:
+    st.warning(f"Google Sheet 자동 읽기 실패 → 8/16 fallback 포트를 사용 중입니다. 원인: {portfolio_error}")
+else:
+    st.caption(f"✅ 포트 데이터: {portfolio['데이터원'].iloc[0]} · 최신 조회")
+
+if page == "🏠 내 포트":
+    render_portfolio_page(portfolio, market_pack, crash_df, settings)
+elif page == "📉 시장 레이더":
+    render_market_page(market_pack, percentile_years, freq_years)
+elif page == "🚨 폭락 자산":
+    render_crash_page(crash_df, settings)
+else:
+    render_settings_page(settings)
+
+st.divider()
+st.caption("투자 의사결정 보조용 개인 대시보드입니다. 가격 데이터 오류·지연, Google Sheet 접근권한, 세금·슬리피지·환율·상품구조를 실제 주문 전 별도로 확인하세요.")
