@@ -1,4 +1,6 @@
-streamlit>=1.36
+streamlit>=1.28
 pandas>=2.0
-numpy>=1.26
+numpy>=1.24
 yfinance>=0.2.40
+requests>=2.31
+st-gsheets-connection==0.1.0
